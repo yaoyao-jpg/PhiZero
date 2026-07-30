@@ -1,8 +1,9 @@
 <div align="center">
 
-<img src="https://phi-zero.github.io/assets/img/phizero/logo.png" width="92" alt="PhiZero logo">
-
-# PhiZero
+<h1>
+  <img src="https://phi-zero.github.io/assets/img/phizero/logo.png" width="58" alt="PhiZero logo">
+  PhiZero
+</h1>
 
 ### A World Model Built Around Physical Language
 
@@ -13,14 +14,10 @@ Shuyao Shang · Yuqi Wang · Ruopeng Gao · Xu Chen · Tieniu Tan · Lue Fan · 
 [![Code](https://img.shields.io/badge/Code-Coming_Soon-6f7780?style=for-the-badge)](#release-plan)
 [![License](https://img.shields.io/badge/License-TBD-lightgrey?style=for-the-badge)](#license)
 
-> **The code, pretrained models, and evaluation tools are being prepared for release.**
+> **The code and pretrained models are being prepared for release.**
 > Watch this repository to receive future updates.
 
 </div>
-
-<p align="center">
-  <img src="https://phi-zero.github.io/assets/img/phizero/motivation.png" width="100%" alt="PhiZero motivation">
-</p>
 
 ## Overview
 
@@ -54,10 +51,6 @@ zero-shot transfer across appearances and embodiments.
   Verified, PhyGround, WorldModelBench, and IntPhys2.
 
 ## Method
-
-<p align="center">
-  <img src="https://phi-zero.github.io/assets/img/phizero/Pipeline.webp" width="96%" alt="PhiZero method">
-</p>
 
 PhiZero contains two main components:
 
@@ -117,4 +110,3 @@ release.
 PhiZero builds on the progress of open video generation and vision-language
 modeling. We thank the authors and contributors of the open-source projects and
 benchmarks that made this research possible.
-
