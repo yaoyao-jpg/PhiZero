@@ -15,6 +15,6 @@ Shuyao Shang · Yuqi Wang · Ruopeng Gao · Xu Chen · Tieniu Tan · Lue Fan · 
 [![Code](https://img.shields.io/badge/Code-Coming_Soon-6f7780?style=for-the-badge)](https://github.com/yaoyao-jpg/PhiZero)
 
 > **The code and pretrained models are being prepared for release.**
-> Watch this repository to receive future updates.
+> Watch or Star this repository to receive future updates.
 
 </div>
