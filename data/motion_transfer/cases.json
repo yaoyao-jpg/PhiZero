@@ -1,0 +1,57 @@
+[
+  {
+    "id": "ego2dex_transfer_01",
+    "source_video": "cases/ego2dex/ego2dex_transfer_01/source_video.mp4",
+    "target_image": "cases/ego2dex/ego2dex_transfer_01/ego2dex_transfer_01.png"
+  },
+  {
+    "id": "ego2dex_transfer_02",
+    "source_video": "cases/ego2dex/ego2dex_transfer_02/source_video.mp4",
+    "target_image": "cases/ego2dex/ego2dex_transfer_02/ego2dex_transfer_02.png"
+  },
+  {
+    "id": "ego2dex_transfer_03",
+    "source_video": "cases/ego2dex/ego2dex_transfer_03/source_video.mp4",
+    "target_image": "cases/ego2dex/ego2dex_transfer_03/ego2dex_transfer_03.png"
+  },
+  {
+    "id": "human2robot_transfer_01",
+    "source_video": "cases/human2robot/human2robot_transfer_01/source_video.mp4",
+    "target_image": "cases/human2robot/human2robot_transfer_01/human2robot_transfer_01.png"
+  },
+  {
+    "id": "human2robot_transfer_02",
+    "source_video": "cases/human2robot/human2robot_transfer_02/source_video.mp4",
+    "target_image": "cases/human2robot/human2robot_transfer_02/human2robot_transfer_02.png"
+  },
+  {
+    "id": "human2robot_transfer_03",
+    "source_video": "cases/human2robot/human2robot_transfer_03/source_video.mp4",
+    "target_image": "cases/human2robot/human2robot_transfer_03/human2robot_transfer_03.png"
+  },
+  {
+    "id": "human2robot_transfer_04",
+    "source_video": "cases/human2robot/human2robot_transfer_04/source_video.mp4",
+    "target_image": "cases/human2robot/human2robot_transfer_04/human2robot_transfer_04.png"
+  },
+  {
+    "id": "sim2real_transfer_01",
+    "source_video": "cases/sim2real/sim2real_transfer_01/source_video.mp4",
+    "target_image": "cases/sim2real/sim2real_transfer_01/sim2real_transfer_01.png"
+  },
+  {
+    "id": "sim2real_transfer_02",
+    "source_video": "cases/sim2real/sim2real_transfer_02/source_video.mp4",
+    "target_image": "cases/sim2real/sim2real_transfer_02/sim2real_transfer_02.png"
+  },
+  {
+    "id": "sim2real_transfer_03",
+    "source_video": "cases/sim2real/sim2real_transfer_03/source_video.mp4",
+    "target_image": "cases/sim2real/sim2real_transfer_03/sim2real_transfer_03.png"
+  },
+  {
+    "id": "sim2real_transfer_04",
+    "source_video": "cases/sim2real/sim2real_transfer_04/source_video.mp4",
+    "target_image": "cases/sim2real/sim2real_transfer_04/sim2real_transfer_04.png"
+  }
+]

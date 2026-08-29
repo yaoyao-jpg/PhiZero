@@ -1,0 +1,115 @@
+import argparse
+
+
+def add_dataset_base_config(parser: argparse.ArgumentParser):
+    parser.add_argument("--dataset_base_path", type=str, default="", required=True, help="Base path of the dataset.")
+    parser.add_argument("--dataset_metadata_path", type=str, default=None, help="Path to the metadata file of the dataset.")
+    parser.add_argument("--dataset_repeat", type=int, default=1, help="Number of times to repeat the dataset per epoch.")
+    parser.add_argument("--dataset_num_workers", type=int, default=0, help="Number of workers for data loading.")
+    parser.add_argument("--data_file_keys", type=str, default="image,video", help="Data file keys in the metadata. Comma-separated.")
+    return parser
+
+def add_image_size_config(parser: argparse.ArgumentParser):
+    parser.add_argument("--height", type=int, default=None, help="Height of images. Leave `height` and `width` empty to enable dynamic resolution.")
+    parser.add_argument("--width", type=int, default=None, help="Width of images. Leave `height` and `width` empty to enable dynamic resolution.")
+    parser.add_argument("--max_pixels", type=int, default=1024*1024, help="Maximum number of pixels per frame, used for dynamic resolution.")
+    return parser
+
+def add_video_size_config(parser: argparse.ArgumentParser):
+    parser.add_argument("--height", type=int, default=None, help="Height of images. Leave `height` and `width` empty to enable dynamic resolution.")
+    parser.add_argument("--width", type=int, default=None, help="Width of images. Leave `height` and `width` empty to enable dynamic resolution.")
+    parser.add_argument("--max_pixels", type=int, default=1024*1024, help="Maximum number of pixels per frame, used for dynamic resolution.")
+    parser.add_argument("--num_frames", type=int, default=81, help="Number of frames per video. Frames are sampled from the video prefix.")
+    return parser
+
+def add_model_config(parser: argparse.ArgumentParser):
+    parser.add_argument("--model_paths", type=str, default=None, help="Paths to load models. In JSON format.")
+    parser.add_argument("--model_id_with_origin_paths", type=str, default=None, help="Model ID with origin paths, e.g., Wan-AI/Wan2.1-T2V-1.3B:diffusion_pytorch_model*.safetensors. Comma-separated.")
+    parser.add_argument("--extra_inputs", default=None, type=str, help="Additional model inputs, comma-separated.")
+    parser.add_argument("--fp8_models", default=None, type=str, help="Models with FP8 precision, comma-separated.")
+    parser.add_argument("--offload_models", default=None, type=str, help="Models with offload, comma-separated. Only used in splited training.")
+    parser.add_argument("--resume_from_checkpoint", default=None, type=str, help="Resume training from checkpoint file. Only single model training is supported.")
+    return parser
+
+def add_training_config(parser: argparse.ArgumentParser):
+    parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate.")
+    parser.add_argument("--num_epochs", type=int, default=1, help="Number of epochs.")
+    parser.add_argument("--trainable_models", type=str, default=None, help="Models to train, e.g., dit, vae, text_encoder.")
+    parser.add_argument("--find_unused_parameters", default=False, action="store_true", help="Whether to find unused parameters in DDP.")
+    parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay.")
+    parser.add_argument("--task", type=str, default="sft", required=False, help="Task type.")
+    parser.add_argument("--customized_optimizer", type=str, default=None, help="Customized optimizer, e.g., `bitsandbytes.optim.Adam8bit` and `torch.optim.Adam`. The default optimizer is `torch.optim.AdamW`.")
+    return parser
+
+def add_output_config(parser: argparse.ArgumentParser):
+    parser.add_argument("--output_path", type=str, default="./models", help="Output save path.")
+    parser.add_argument("--remove_prefix_in_ckpt", type=str, default="pipe.dit.", help="Remove prefix in ckpt.")
+    parser.add_argument("--save_steps", type=int, default=None, help="Number of checkpoint saving invervals. If None, checkpoints will be saved every epoch.")
+    return parser
+
+def add_lora_config(parser: argparse.ArgumentParser):
+    parser.add_argument("--lora_base_model", type=str, default=None, help="Which model LoRA is added to.")
+    parser.add_argument("--lora_target_modules", type=str, default="q,k,v,o,ffn.0,ffn.2", help="Which layers LoRA is added to.")
+    parser.add_argument("--lora_rank", type=int, default=32, help="Rank of LoRA.")
+    parser.add_argument("--lora_checkpoint", type=str, default=None, help="Path to the LoRA checkpoint. If provided, LoRA will be loaded from this checkpoint.")
+    parser.add_argument("--preset_lora_path", type=str, default=None, help="Path to the preset LoRA checkpoint. If provided, this LoRA will be fused to the base model.")
+    parser.add_argument("--preset_lora_model", type=str, default=None, help="Which model the preset LoRA is fused to.")
+    return parser
+
+def add_gradient_config(parser: argparse.ArgumentParser):
+    parser.add_argument("--use_gradient_checkpointing", default=False, action="store_true", help="Whether to use gradient checkpointing.")
+    parser.add_argument("--use_gradient_checkpointing_offload", default=False, action="store_true", help="Whether to offload gradient checkpointing to CPU memory.")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Gradient accumulation steps.")
+    return parser
+
+def add_template_model_config(parser: argparse.ArgumentParser):
+    parser.add_argument("--template_model_id_or_path", type=str, default=None, help="Model ID of path of template models.")
+    parser.add_argument("--enable_lora_hot_loading", default=False, action="store_true", help="Whether to enable LoRA hot-loading. Only available for image-to-lora models.")
+    return parser
+
+def add_offload_training_config(parser: argparse.ArgumentParser):
+    parser.add_argument("--enable_model_cpu_offload", default=False, action="store_true", help="Enable layer offload training. Weights are kept on CPU and loaded to GPU one layer at a time.")
+    parser.add_argument("--enable_optimizer_cpu_offload", default=False, action="store_true", help="When --enable_model_cpu_offload is enabled, run optimizer on CPU. All params are offloaded to CPU. Default is False (trainable params stay on GPU, optimizer on GPU).")
+    parser.add_argument("--cpu_offload_split_threshold", type=int, default=None, help="Experimental! When --enable_model_cpu_offload is enabled, modules with total params above this threshold (in MB) are recursively split into children. None means offload every leaf module directly. Default: None.")
+    return parser
+
+def add_logger_config(parser: argparse.ArgumentParser):
+    parser.add_argument("--enable_tensorboard_log", default=False, action="store_true", help="Enable tensorboard for logging.")
+    parser.add_argument("--enable_swanlab_log", default=False, action="store_true", help="Enable swanlab for logging.")
+    parser.add_argument("--swanlab_project", type=str, default="DiffSynth-Studio", help="SwanLab project name.")
+    parser.add_argument("--enable_wandb_log", default=False, action="store_true", help="Enable wandb for logging.")
+    parser.add_argument("--wandb_project", type=str, default="DiffSynth-Studio", help="Wandb project name.")
+    return parser
+
+def add_dmd2_config(parser: argparse.ArgumentParser):
+    parser.add_argument("--dmd2_student_update_freq", type=int, default=5, help="Update student once every N DMD2 iterations.")
+    parser.add_argument("--dmd2_student_sample_steps", type=int, default=4, help="Number of distilled student sampling steps.")
+    parser.add_argument("--dmd2_student_sample_type", type=str, default="sde", choices=["sde", "ode"], help="Student sampling type.")
+    parser.add_argument("--dmd2_student_schedule", type=str, default="uniform", choices=["uniform"], help="Student sigma schedule.")
+    parser.add_argument("--dmd2_student_t_list", type=str, default=None, help="Optional student sigma schedule, including the final 0.")
+    parser.add_argument("--dmd2_matching_t_min", type=float, default=0.001, help="Minimum matching sigma sampled for DMD2.")
+    parser.add_argument("--dmd2_matching_t_max", type=float, default=0.999, help="Maximum matching sigma sampled for DMD2.")
+    parser.add_argument("--dmd2_matching_t_sampling", type=str, default="uniform", choices=["uniform", "logitnormal"], help="Sample matching sigma.")
+    parser.add_argument("--dmd2_matching_t_mean", type=float, default=0.0, help="Mean for logitnormal matching timestep sampling.")
+    parser.add_argument("--dmd2_matching_t_std", type=float, default=1.0, help="Std for logitnormal matching timestep sampling.")
+    parser.add_argument("--dmd2_gan_loss_weight", type=float, default=0.03, help="Generator GAN loss weight.")
+    parser.add_argument("--dmd2_gan_r1_reg_weight", type=float, default=0.0, help="Approximate R1 regularization weight for the discriminator.")
+    parser.add_argument("--dmd2_gan_r1_reg_alpha", type=float, default=0.1, help="Noise scale for approximate R1 regularization.")
+    parser.add_argument("--dmd2_fake_score_learning_rate", type=float, default=None, help="Learning rate for the fake score model.")
+    parser.add_argument("--dmd2_discriminator_learning_rate", type=float, default=None, help="Learning rate for the discriminator.")
+    parser.add_argument("--dmd2_feature_indices", type=str, default=None, help="Model feature indices used by the DMD2 discriminator.")
+    parser.add_argument("--dmd2_teacher_cfg_scale", type=float, default=1.0, help="CFG scale.")
+    parser.add_argument("--dmd2_student_grad_clip_norm", type=float, default=10.0, help="Clip student gradients to this norm.")
+    return parser
+
+def add_general_config(parser: argparse.ArgumentParser):
+    parser = add_dataset_base_config(parser)
+    parser = add_model_config(parser)
+    parser = add_training_config(parser)
+    parser = add_output_config(parser)
+    parser = add_lora_config(parser)
+    parser = add_gradient_config(parser)
+    parser = add_template_model_config(parser)
+    parser = add_offload_training_config(parser)
+    parser = add_logger_config(parser)
+    return parser

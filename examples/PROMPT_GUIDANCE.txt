@@ -1,0 +1,337 @@
+PHIZERO INFERENCE PROMPT GUIDANCE
+=================================
+
+1. What the prompt should describe
+----------------------------------
+
+PhiZero receives two user inputs: a first frame and an English caption. The
+first frame establishes the visible subjects, appearance, layout, and initial
+state. The caption tells the model how that visible scene begins to evolve.
+
+Write the prompt as a video caption describing visible future motion. It
+should not be a command, a list of action keywords, a negative prompt, or a
+shot-by-shot script. A good prompt reads like a concise observation of a video:
+it identifies the moving subject, states the main action or interaction, and
+uses spatial language to make the intended motion unambiguous.
+
+The training-caption specification uses one flowing English sentence or short
+paragraph of 25-60 words, written in the present tense. As a practical default,
+we recommend one sentence of roughly 25-40 words. The 19 prompts included in
+this release contain 26-35 words, with a median of 30 words.
+
+The released case manifest stores only the caption text. The inference code
+adds the learned instruction wrapper internally, so a caption should not
+include "<image>", "Text caption:", "Predict the motion token sequence", chat
+roles, or any other formatting.
+
+
+2. Recommended pattern
+----------------------
+
+Use the following pattern as a guide, not as a rigid form:
+
+  [visible subject anchor]
+  + [high-level initiating action or interaction]
+  + [manner, speed, and frame-relative direction]
+  + [optional immediate visible consequence]
+  + [setting or spatial relation]
+  + [optional camera, framing, lighting, or visual style]
+
+A copy-ready sentence template is:
+
+  A [visible subject] [primary action] [manner and direction],
+  [optional immediate visible consequence], in [setting], while the camera
+  [optional camera behavior].
+
+Not every prompt needs every field. The most useful core is:
+
+  visible subject + concrete action + spatial or motion detail
+
+Setting, lighting, color, framing, and camera behavior are supporting details.
+Include them when they help identify the scene or control the result, but do
+not let static description overwhelm the motion.
+
+
+3. Detailed writing rules
+-------------------------
+
+3.1 Anchor the prompt to a subject visible in the first frame
+
+Name the subject whose motion should be generated. When more than one possible
+subject is visible, add a short appearance or position cue:
+
+  A woman in a red jacket ...
+  The man standing beside the table ...
+  The dog near the wooden fence ...
+  A right hand holding a glass cup ...
+  The woman on the left ...
+
+Use appearance only to locate the subject. The first frame already supplies
+fine visual detail, so there is no need to repeat every item of clothing,
+texture, object, or background element.
+
+Avoid an ungrounded pronoun such as "he", "she", or "it" when the first frame
+contains several people or objects. For coordinated motion, name the group and
+its relationship directly, for example, "Two men carry a wooden box together."
+
+
+3.2 Describe a concrete, observable action
+
+Prefer verbs that correspond to visible motion:
+
+  walks toward the doorway
+  turns her head to the left
+  raises his right hand
+  bends forward and lifts the bag
+  pours batter into the pan
+  rolls down the slope and strikes the block
+
+Avoid abstract intent or quality words that do not specify motion:
+
+  moves naturally
+  acts energetically
+  tries to leave
+  behaves realistically
+  performs an interesting action
+
+The caption should emphasize the high-level initiating action or interaction.
+It may include one immediate visible consequence when that consequence defines
+the physical event, but it should not narrate every intermediate state or the
+entire final history of the clip.
+
+
+3.3 Make motion geometry precise
+
+Speed, manner, direction, and spatial relation are often more informative than
+generic style adjectives. Useful expressions include:
+
+  slowly, quickly, gently, steadily, repeatedly
+  upward, downward, forward, backward
+  from the left side of the frame to the right
+  toward the camera, away from the camera
+  toward the doorway, across the room, along the street
+  into the bowl, beside the plate, near the center of the floor
+
+For left and right, prefer frame-relative language when possible. "Moves from
+the left side of the frame to the right" is clearer than "moves right". If the
+direction belongs to a person rather than the image plane, state the relation,
+for example, "turns toward the person standing on her left."
+
+
+3.4 Describe interactions through visible cause and effect
+
+For hand-object interaction, collision, deformation, fluid motion, or another
+physical event, state what contacts or acts on what. A concise immediate result
+can remove ambiguity:
+
+  A hand lifts the cup and places it beside the plate.
+  A red cart strikes a blue cart, pushing it backward.
+  Thick batter pours into the pan and spreads outward.
+  Green slime sags at the edges and forms a wider shape.
+
+Describe what a viewer can see rather than naming an abstract law or asking the
+model to "simulate physics." For example:
+
+  Less useful: The ball obeys gravity and conservation of momentum.
+  Better:     The ball falls, strikes the floor, and bounces upward.
+
+Use result clauses selectively. The training captions prioritize the initiating
+action over exhaustive temporal evolution. "The bottle pours liquid onto the
+charcoal, causing the flames to surge upward" is useful; a frame-by-frame list
+of every flame shape is not.
+
+
+3.5 Keep temporal structure short and coherent
+
+Words such as "while", "as", "then", "before", and "after" can distinguish
+simultaneous and sequential motion:
+
+  while / as       simultaneous events
+  then             one short follow-up action
+  before / after   an explicit order when the order matters
+  continues        sustained motion
+  repeatedly       repeated motion
+
+For the released 33-frame, 8-FPS setting, describe one main event or at most a
+few tightly connected actions. Prefer a unified caption over a numbered list or
+timeline. "A woman lifts the cup, takes a sip, and lowers it toward the table"
+is appropriate; a long story containing unrelated actions and scene changes is
+not.
+
+
+3.6 Distinguish subject motion from camera motion
+
+Camera behavior is optional. If it matters, make "the camera" the explicit
+subject of the camera clause:
+
+  The camera slowly pans to the right.
+  The camera tracks the running man from the side.
+  The camera moves forward along the street.
+  The camera remains fixed in a steady medium shot.
+
+Avoid ambiguous wording such as "the scene moves left." State whether an object
+moves within the frame or whether the camera moves:
+
+  The cyclist moves from right to left while the camera remains fixed.
+  The camera pans left to follow the cyclist.
+
+Do not request mutually incompatible camera behavior, such as a fixed camera
+that also pans left.
+
+
+3.7 Use scene, framing, light, color, and style as supporting context
+
+The training captions include observable setting, camera/framing, lighting,
+colors, and visual style when useful. Short phrases are usually sufficient:
+
+  in a softly lit kitchen
+  on a sunlit city street
+  against a blurred green background
+  in a steady overhead close-up
+  captured in a fixed wide shot
+  in slow-motion footage
+
+Keep the expected action as the grammatical center of the sentence. A prompt
+that only inventories static appearance does not provide a motion condition.
+
+
+3.8 Stay consistent with the first frame
+
+The caption and first frame should refer to the same visible scene. Do not
+introduce a different main character, object, location, or initial position
+unless its entrance is itself the intended visible event. Do not describe a
+subject as standing on the left if it is clearly on the right.
+
+The first frame controls appearance more directly than text. Use the caption to
+specify motion and interaction, not to redesign the target image. For motion
+transfer, describe the source motion using subject-neutral language when the
+target has a different embodiment; preserve the motion geometry and interaction
+rather than insisting on source-specific identity details.
+
+
+4. Strong prompt examples
+-------------------------
+
+Human motion:
+
+  A woman in a red jacket walks steadily from the left side of the frame toward
+  the doorway, reaching for its handle in a softly lit room while the camera
+  remains fixed.
+
+Hand-object interaction:
+
+  In a steady close-up, a right hand lifts the blue cup from the table and moves
+  it beside the plate, with warm indoor light reflecting across the glass
+  surface.
+
+Coordinated motion:
+
+  Two men carry a wooden box together from the back of the room toward the
+  foreground, keeping it level as a side-tracking camera follows their
+  coordinated movement.
+
+Collision:
+
+  A red cart rolls quickly from left to right and strikes a blue cart near the
+  center of the floor, pushing it backward in a fixed wide shot.
+
+Fluid motion:
+
+  Thick pancake batter pours from a bowl into the center of a heated pan,
+  spreading outward into a wider circular pool in a steady overhead close-up.
+
+Deformation:
+
+  A translucent block of green slime slowly spreads across the plastic sheet,
+  sagging at the edges and forming a wider, flatter shape while the camera
+  remains fixed.
+
+Camera-aware motion:
+
+  A cyclist rides steadily down the sunlit street away from the viewer while
+  the camera tracks forward behind them, keeping the rider centered in a
+  medium shot.
+
+Object release:
+
+  A hand releases a small glass ball above the wooden floor, allowing it to fall
+  straight downward and bounce near the center of a steady close-up view.
+
+
+5. Common failure patterns and revisions
+----------------------------------------
+
+Keyword list:
+
+  Avoid:  woman, walking, doorway, camera motion
+  Use:    A woman walks steadily toward the doorway while the camera remains
+          fixed in a medium shot.
+
+Command language:
+
+  Avoid:  Make the woman walk naturally and keep everything realistic.
+  Use:    A woman walks slowly across the room toward the open doorway in a
+          steady full-body shot.
+
+Abstract physics:
+
+  Avoid:  Simulate gravity and conservation of momentum realistically.
+  Use:    A metal ball falls onto the floor, rebounds upward, and settles near
+          the point of impact in a fixed close-up.
+
+Ambiguous motion:
+
+  Avoid:  The person moves over there while the scene shifts.
+  Use:    The person walks from the right side of the frame toward the table as
+          the camera pans left to follow.
+
+Overwritten storyline:
+
+  Avoid:  First she enters, then finds a cup, fills it, talks to another person,
+          crosses the room, opens a window, and finally sits down.
+  Use:    A woman enters from the left, walks toward the table, and reaches for
+          a cup while the camera holds a steady wide view.
+
+Static-only description:
+
+  Avoid:  A beautiful woman in a detailed red jacket stands in a luxurious room
+          with cinematic lighting and rich colors.
+  Use:    A woman in a red jacket turns away from the window and walks toward
+          the center of the warmly lit room in a steady medium shot.
+
+
+6. Formats to avoid
+-------------------
+
+Do not use:
+
+  - isolated keywords or tag lists;
+  - imperative instructions such as "make", "generate", or "animate";
+  - numbered shots, timestamps, per-frame coordinates, JSON, or XML;
+  - a long chain of unrelated events or multiple scene changes;
+  - mostly static appearance with no future action;
+  - abstract intentions or physical-law names without visible motion;
+  - long lists of negative constraints;
+  - contradictory subject or camera directions;
+  - content that conflicts with the supplied first frame;
+  - Chinese, mixed Chinese-English, or instruction/chat formatting.
+
+
+7. Final checklist
+------------------
+
+Before inference, check that the prompt:
+
+  [ ] is written in English and present tense;
+  [ ] is one flowing caption, normally 25-40 words and within 25-60 words;
+  [ ] identifies a subject visible in the first frame;
+  [ ] states a concrete high-level action or interaction;
+  [ ] gives useful direction, speed, manner, or spatial relations;
+  [ ] includes only a concise visible consequence when one is needed;
+  [ ] distinguishes subject motion from camera motion;
+  [ ] uses setting and visual details only as supporting context;
+  [ ] remains consistent with the first frame; and
+  [ ] contains no command syntax, timeline, token instruction, or negative list.
+
+If these conditions are met, the prompt is close to the caption distribution
+used to train PhiZero's Physical Language Reasoner.

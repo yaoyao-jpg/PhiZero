@@ -1,0 +1,24 @@
+repos:
+  - repo: https://github.com/pycqa/flake8.git
+    rev: 7.3.0
+    hooks:
+      - id: flake8
+  - repo: https://github.com/PyCQA/isort.git
+    rev: 8.0.1
+    hooks:
+      - id: isort
+  - repo: https://github.com/google/yapf.git
+    rev: v0.43.0
+    hooks:
+      - id: yapf
+  - repo: https://github.com/pre-commit/pre-commit-hooks.git
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: check-yaml
+      - id: end-of-file-fixer
+      - id: requirements-txt-fixer
+      - id: double-quote-string-fixer
+      - id: check-merge-conflict
+      - id: mixed-line-ending
+        args: ["--fix=lf"]

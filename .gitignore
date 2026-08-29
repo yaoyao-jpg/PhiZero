@@ -1,0 +1,45 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments and local environment variables
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# Python build artifacts
+build/
+dist/
+*.egg-info/
+
+# Notebook, editor, and OS files
+.ipynb_checkpoints/
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Runtime outputs and experiment logs
+outputs/
+logs/
+*.log
+wandb/
+runs/
+
+# Downloaded checkpoints and external repositories/datasets
+/ckpt/
+/third_party/
+
+# Local coding-agent state
+/.agents/
+/.codex/

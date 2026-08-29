@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "benchmark": "Physics-IQ Verified",
+  "reasoner": "ckpt/reasoner",
+  "diffusion_decoder": "ckpt/tokenizer/tokenizer.safetensors",
+  "settings": {
+    "cases": 198,
+    "seed": 1,
+    "reasoner_sampling": "greedy",
+    "physical_language_tokens": 256,
+    "codebook_size": 25000,
+    "num_inference_steps": 50,
+    "fps": 8,
+    "saved_frames": 40
+  },
+  "metrics": {
+    "physics_iq_verified": 41.10334228200859,
+    "physics_iq_original_formula": 40.65054255554525,
+    "physics_iq_legacy_original_round": 40.66
+  },
+  "descriptions_semantic_sha256": "f29855e8e15bdee585b10ed02160d0b4425c12dc38e565e80ee6c8198e716da2",
+  "source_metrics_sha256": "de23885a050f9d719ba03fc4df4c93b29178c0e81cbccddfafceacd69a803911"
+}

@@ -1,0 +1,267 @@
+
+# 快速开始
+
+ms-swift引入了Megatron的并行技术来加速大模型的训练，包括数据并行、张量并行、流水线并行、序列并行，上下文并行，专家并行。支持Qwen3、Qwen3.5、Deepseek-R1、GLM4.5、GPT-OSS等模型的CPT/SFT/GRPO/DPO/KTO/RM。完整支持的模型可以参考[支持的模型与数据集文档](../Instruction/Supported-models-and-datasets.md)。
+
+
+| 方法   | 全参数 | LoRA | MoE | 多模态 | FP8 |
+| ------ | ------ | ---- | ----- | ----- | ----- |
+| 预训练 | ✅ | ✅| ✅ | ✅ | ✅ |
+| [指令监督微调](https://github.com/modelscope/ms-swift/tree/main/examples/megatron) | ✅ | ✅| ✅ | ✅ | ✅ |
+| [GRPO](https://github.com/modelscope/ms-swift/tree/main/examples/megatron/grpo) | ✅ | ✅| ✅ | ✅ | ✅ |
+| [GKD](https://github.com/modelscope/ms-swift/tree/main/examples/megatron/rlhf/gkd) | ✅ | ✅| ✅ | ✅ | ✅ |
+| [DPO](https://github.com/modelscope/ms-swift/tree/main/examples/megatron/rlhf/dpo) | ✅ | ✅| ✅ | ✅ | ✅ |
+| [KTO](https://github.com/modelscope/ms-swift/tree/main/examples/megatron/rlhf/kto) | ✅ | ✅| ✅ | ✅ | ✅ |
+| [RM](https://github.com/modelscope/ms-swift/tree/main/examples/megatron/rlhf/rm) | ✅ | ✅| ✅ | ✅ | ✅ |
+| [Embedding](https://github.com/modelscope/ms-swift/tree/main/examples/megatron/embedding) | ✅ | ✅| ✅ | ✅ | ✅ |
+| [Reranker](https://github.com/modelscope/ms-swift/tree/main/examples/megatron/reranker) | ✅ | ✅| ✅ | ✅ | ✅ |
+| [序列分类](https://github.com/modelscope/ms-swift/tree/main/examples/megatron/seq_cls) | ✅ | ✅| ✅ | ✅ | ✅ |
+
+
+## 环境准备
+使用Megatron-SWIFT，除了安装swift依赖外，还需要安装以下内容：
+
+```shell
+# transformer_engine
+# 若出现安装错误，可以参考该issue解决: https://github.com/modelscope/ms-swift/issues/3793
+pip install --no-build-isolation transformer-engine[pytorch] --no-cache-dir
+# cuda13
+pip install pybind11
+pip install git+https://github.com/NVIDIA/TransformerEngine.git@stable --no-build-isolation
+
+# apex
+# 提示：Megatron-SWIFT可以在不含apex的环境下运行，额外设置`--gradient_accumulation_fusion false`即可。
+git clone https://github.com/NVIDIA/apex
+cd apex
+pip install -v --disable-pip-version-check --no-cache-dir --no-build-isolation --config-settings "--build-option=--cpp_ext" --config-settings "--build-option=--cuda_ext" ./
+
+# mcore-bridge
+pip install mcore-bridge -U
+# 安装main分支
+# pip install git+https://github.com/modelscope/mcore-bridge.git
+
+# 若使用多机训练，请额外设置`MODELSCOPE_CACHE`环境变量为共享存储路径
+# 这将确保数据集缓存共享，而加速预处理速度。
+# 注意：这步很关键，不然多机训练可能因随机性问题导致数据不一致而训练卡住。
+export MODELSCOPE_CACHE='/xxx/shared'
+
+# flash_attn
+# 选择合适的版本进行安装：https://github.com/Dao-AILab/flash-attention/releases/tag/v2.8.3
+# 注意：请勿安装高于transformer_engine限制的最高版本：https://github.com/NVIDIA/TransformerEngine/blob/release_v2.10/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L118
+MAX_JOBS=8 pip install "flash-attn==2.8.3" --no-build-isolation
+```
+
+或者你也可以使用镜像：（历史镜像查看[这里](../GetStarted/SWIFT-installation.md#镜像)）
+```
+# cu130 (fp8 training)
+modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda13.0.3-py312-torch2.11.0-vllm0.23.0-modelscope1.38.1-swift4.4.1
+modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda13.0.3-py312-torch2.11.0-vllm0.23.0-modelscope1.38.1-swift4.4.1
+modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda13.0.3-py312-torch2.11.0-vllm0.23.0-modelscope1.38.1-swift4.4.1
+
+# cu128
+modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda12.8.1-py311-torch2.10.0-vllm0.17.1-modelscope1.34.0-swift4.0.3
+modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda12.8.1-py311-torch2.10.0-vllm0.17.1-modelscope1.34.0-swift4.0.3
+modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda12.8.1-py311-torch2.10.0-vllm0.17.1-modelscope1.34.0-swift4.0.3
+
+# cu129 (fp8 training)
+modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda12.9.1-py312-torch2.10.0-vllm0.19.1-modelscope1.35.4-swift4.1.3
+modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda12.9.1-py312-torch2.10.0-vllm0.19.1-modelscope1.35.4-swift4.1.3
+modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda12.9.1-py312-torch2.10.0-vllm0.19.1-modelscope1.35.4-swift4.1.3
+```
+
+推荐运行环境：
+|              | 范围           | 推荐          | 备注                 |
+|--------------|--------------|-------------|--------------------|
+| python       | >=3.10        | 3.12        |                    |
+| cuda         |              | cuda12.8/13.0      |                    |
+| torch        | >=2.0        | 2.8.0/2.11.0       |                    |
+| transformer-engine    | >=2.3       |  2.16.0    |                  |
+| apex |   |  0.1 | |
+| megatron-core    |   >=0.16,<0.20    | 0.18.0      |                  |
+| mcore-bridge    |    >=1.3.0    |  1.6.0    |                  |
+| flash-attn    |        | 2.8.3/4.0.0b15   |                  |
+| transformers | >=4.33       | 4.57.6/5.12.1   |                    |
+| modelscope   | >=1.23       |             |                    |
+| peft         | >=0.11,<0.20 |             |      LoRA          |
+| trl          | >=0.15,<1.0 |       |      RLHF        |
+
+
+## 快速入门案例
+
+这里介绍使用2卡80GiB A100对Qwen2.5-7B-Instruct模型进行自我认知微调的快速入门案例，以下最佳实践可以在10分钟内完成。
+
+### 传统方式
+
+首先，我们需要将HF格式的权重转为Megatron格式：
+- 多卡权重转换：将`CUDA_VISIBLE_DEVICES=0`删除即可使用多卡权重转换。
+- 转换精度测试：`--test_convert_precision true`将测试转换精度。在MoE大型模型的转换时，该参数所需时间较长，且需要更多的内存消耗，可酌情去除。
+
+```shell
+CUDA_VISIBLE_DEVICES=0 \
+swift export \
+    --model Qwen/Qwen2.5-7B-Instruct \
+    --to_mcore true \
+    --torch_dtype bfloat16 \
+    --output_dir Qwen2.5-7B-Instruct-mcore \
+    --test_convert_precision true
+```
+
+然后，使用以下脚本进行训练，训练所需显存资源为2*80GiB：
+- 若使用多机训练，建议共享磁盘，并将`--output_dir`指定为相同的路径。
+```shell
+PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True' \
+NPROC_PER_NODE=2 \
+CUDA_VISIBLE_DEVICES=0,1 \
+megatron sft \
+    --mcore_model Qwen2.5-7B-Instruct-mcore \
+    --save_safetensors false \
+    --dataset 'AI-ModelScope/alpaca-gpt4-data-zh#500' \
+              'AI-ModelScope/alpaca-gpt4-data-en#500' \
+              'swift/self-cognition#500' \
+    --tensor_model_parallel_size 2 \
+    --sequence_parallel true \
+    --micro_batch_size 16 \
+    --global_batch_size 16 \
+    --recompute_granularity full \
+    --recompute_method uniform \
+    --recompute_num_layers 1 \
+    --finetune true \
+    --cross_entropy_loss_fusion true \
+    --lr 1e-5 \
+    --lr_warmup_fraction 0.05 \
+    --min_lr 1e-6 \
+    --num_train_epochs 1 \
+    --output_dir megatron_output/Qwen2.5-7B-Instruct \
+    --save_steps 100 \
+    --max_length 2048 \
+    --system 'You are a helpful assistant.' \
+    --dataloader_num_workers 4 \
+    --no_save_optim true \
+    --no_save_rng true \
+    --dataset_num_proc 4 \
+    --model_author swift \
+    --model_name swift-robot
+```
+
+最后，将Megatron格式权重转为HF格式：
+- 注意：`--mcore_model`请指向`iter_xxx`的上级目录。默认会使用`latest_checkpointed_iteration.txt`中对应的checkpoint。
+- 若出现OOM，将`CUDA_VISIBLE_DEVICES=0`删除。若出现内存不足，请将`--test_convert_precision true`删除。
+```shell
+CUDA_VISIBLE_DEVICES=0 \
+swift export \
+    --mcore_model megatron_output/Qwen2.5-7B-Instruct/vx-xxx/checkpoint-xxx \
+    --to_hf true \
+    --torch_dtype bfloat16 \
+    --output_dir megatron_output/Qwen2.5-7B-Instruct/vx-xxx/checkpoint-xxx-hf \
+    --test_convert_precision true
+```
+
+我们对生成的HF格式权重进行推理：
+```shell
+CUDA_VISIBLE_DEVICES=0 \
+swift infer \
+    --model megatron_output/Qwen2.5-7B-Instruct/vx-xxx/checkpoint-xxx-hf \
+    --stream true \
+    --temperature 0 \
+    --max_new_tokens 2048
+```
+
+推理结果如下：
+```
+<<< who are you?
+I am a language model developed by swift, you can call me swift-robot. How can I assist you?
+```
+
+Megatron Ray 训练，参考[Ray 文档](../Instruction/Ray.md)
+
+### Mcore-Bridge【推荐】
+
+Mcore-Bridge去除模型转换的繁琐过程。具体参考[Mcore-Bridge文档](./Mcore-Bridge.md)。
+
+训练脚本：
+```bash
+PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True' \
+NPROC_PER_NODE=2 \
+CUDA_VISIBLE_DEVICES=0,1 \
+megatron sft \
+    --model Qwen/Qwen2.5-7B-Instruct \
+    --save_safetensors true \
+    --dataset 'AI-ModelScope/alpaca-gpt4-data-zh#500' \
+              'AI-ModelScope/alpaca-gpt4-data-en#500' \
+              'swift/self-cognition#500' \
+    --tensor_model_parallel_size 2 \
+    --sequence_parallel true \
+    --micro_batch_size 16 \
+    --global_batch_size 16 \
+    --recompute_granularity full \
+    --recompute_method uniform \
+    --recompute_num_layers 1 \
+    --finetune true \
+    --cross_entropy_loss_fusion true \
+    --lr 1e-5 \
+    --lr_warmup_fraction 0.05 \
+    --min_lr 1e-6 \
+    --num_train_epochs 1 \
+    --output_dir megatron_output/Qwen2.5-7B-Instruct \
+    --save_steps 100 \
+    --max_length 2048 \
+    --system 'You are a helpful assistant.' \
+    --dataloader_num_workers 4 \
+    --no_save_optim true \
+    --no_save_rng true \
+    --dataset_num_proc 4 \
+    --model_author swift \
+    --model_name swift-robot
+```
+
+我们对生成的safetensors格式权重进行推理：
+```shell
+CUDA_VISIBLE_DEVICES=0 \
+swift infer \
+    --model megatron_output/Qwen2.5-7B-Instruct/vx-xxx/checkpoint-xxx \
+    --stream true \
+    --temperature 0 \
+    --max_new_tokens 2048
+```
+
+- 若要进行预训练，你可以使用`megatron pt`替代`megatron sft`，这将会使用生成式的template进行训练。
+- Megatron-SWIFT使用与ms-swift相同的dataset和template处理模块，因此同样支持packing、loss_scale、agent训练等技术。自定义数据集格式参考[自定义数据集文档](../Customization/Custom-dataset.md)。
+- **更多案例**：包括packing、多机、32K上下文、DPO、MoE模型、预训练，可以查看[这里](https://github.com/modelscope/ms-swift/tree/main/examples/megatron)。
+
+
+## 训练技巧
+- 增加训练吞吐量方法：使用packing（不要开启流式）、增加DP、减少重计算、增加计算通信overlap。MoE还可以通过丢弃tokens加速。
+- 并行技术选择：
+  - Megatron-SWIFT的并行技术采用zero1（默认开启use_distributed_optimizer）+各种并行技术的组合。
+  - DP的速度最快，但显存占用较多，使用其他并行技术以降低显存占用。
+  - TP/EP通信量较大，尽量不跨节点（NVLink域内），跨节点建议使用PP/DP；专家层建议使用EP而不是ETP，ETP更节约显存，但速度较慢。
+  - MoE 并行折叠：MoE 相关的并行组与 Dense 组分离。Attention使用 tp-cp-dp-pp 组，MoE 使用 etp-ep-dp-pp 组。
+- 权重转换并行数的选择：Megatron-SWIFT在mcore端使用torch_dist存储格式，训练时可以调整并行数，不需要在权重转化时指定并行数。
+- 关于日志打印：Megatron-SWIFT的日志在last rank进行打印，因为在PP并行中，只有last pp_rank拥有完整的信息。
+
+## Benchmark
+
+使用`megatron sft`和`swift sft`在单机八卡A800环境下进行Dense模型全参数8K上下文训练的速度对比如下：（[shell](https://github.com/modelscope/ms-swift/blob/main/examples/megatron/benchmark/deepspeed.sh)）
+
+**Dense** Qwen2.5-14B:
+
+|          | Megatron-LM | Deepspeed-ZeRO2 | Deepspeed-ZeRO3 |
+| -------- | ----------- | ---------- | ---------- |
+| 训练速度 |      9.04s/it       |  10.32s/it   | 10.56s/it |
+| 显存占用 | 8\*64GB     |  8\*80GB   | 8\*58GB |
+
+使用`megatron sft`和`swift sft`在双机16卡A800环境下进行MoE模型全参数8K上下文训练的速度对比如下：
+
+**MoE** Qwen3-30B-A3B:
+
+- 注意：其中，DeepSpeed测试结果在"transformers<5.0"环境下进行。在"transformers>5.0"，可以通过`--experts_impl grouped_mm`加速训练。
+
+|          | Megatron-LM | DeepSpeed-ZeRO2 | DeepSpeed-ZeRO3 |
+| -------- | ----------- | --------------- | --------------- |
+| 训练速度 | 9.6s/it     | -               | 91.2s/it        |
+| 显存使用 | 16 * 60GiB  | OOM             | 16 * 80GiB      |
+
+
+## Megatron-SWIFT微信群
+
+<img src="https://raw.githubusercontent.com/modelscope/ms-swift/main/docs/resources/wechat/megatron.png" width="250">

@@ -1,0 +1,1796 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
+import base64
+import concurrent.futures
+import inspect
+import json
+import os
+import re
+import time
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+import uuid
+from accelerate.utils import broadcast_object_list, gather_object, is_peft_model, set_seed
+from collections import OrderedDict
+from concurrent.futures import Future
+from contextlib import contextmanager, nullcontext
+from copy import copy, deepcopy
+from dacite import from_dict
+from dataclasses import asdict, dataclass
+from math import ceil
+from peft.utils.save_and_load import get_peft_model_state_dict
+from queue import Queue
+from torch.nn import ModuleList
+from torch.utils.data import DataLoader
+from transformers import PreTrainedModel, TrainerCallback
+from transformers.utils import is_torch_npu_available
+from types import MethodType
+from typing import Any, Dict, List, Optional, Union
+
+from swift.infer_engine import RequestConfig, TransformersEngine
+from swift.infer_engine.protocol import ChatCompletionResponse, RolloutInferRequest, RolloutOutput
+from swift.model import MultiModelKeys
+from swift.rl_core.data import OnPolicySample
+from swift.rl_core.resample import resample_encode_failed_inputs
+from swift.rollout import MultiTurnScheduler, invoke_async_hook, multi_turns, run_multi_turn
+from swift.sequence_parallel import sequence_parallel
+from swift.template import Template
+from swift.tuners import Swift
+from swift.utils import (get_current_device, get_logger, is_deepspeed_enabled, is_vllm_available, remove_response,
+                         to_device, unwrap_model_for_generation)
+from .arguments import GKDConfig, GRPOConfig, RolloutTrainerArgumentsMixin
+from .base_rollout_mixin import BaseRolloutTrainerMixin
+from .gkd_helpers import TeacherServerConfig, parse_teacher_model_server, resolve_dynamic_opd_self_distillation
+from .rlhf_mixin import RLHFTrainerMixin
+from .utils import (VLLM_LORA_INT_ID, VLLM_LORA_NAME, VLLM_LORA_PATH, FlattenedTensorBucket, TensorLoRARequest,
+                    _create_parameter_buckets, _process_bucket_with_flattened_tensor,
+                    add_base_layer_suffix_by_param_names, aggressive_empty_cache, check_vllm_version_ge,
+                    expand_vllm_param_name_aliases, finish_vllm_weight_reload, get_even_process_data,
+                    get_gather_if_zero3_context, parse_prompt_logprobs, patch_lora_merge, patch_lora_unmerge,
+                    patch_vllm_load_adapter, patch_vllm_moe_model_weight_loader, prepare_deepspeed, prepare_fsdp,
+                    profiling_context, profiling_decorator, revert_runtime_names_to_checkpoint, set_expandable_segments,
+                    vllm_supports_lora_load_inplace)
+from .vllm_client import VLLMInferClient
+
+DataType = List[Dict[str, Union[torch.Tensor, Any]]]
+logger = get_logger()
+
+
+@dataclass
+class DataCache:
+    """Cache container for rollout results"""
+    results: List['OnPolicySample']
+
+
+class AsyncGenerateCallback(TrainerCallback):
+    """Callback for async generation in training"""
+
+    def __init__(self, trainer):
+        self.trainer = trainer
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        self.trainer.queue = self.trainer.train_queue
+        train_dataloader = getattr(state, 'train_dataloader', None) or kwargs.get('train_dataloader')
+        self.trainer._prefetch(train_dataloader)
+
+
+class SyncRefModelCallback(TrainerCallback):
+
+    def __init__(self, trainer: 'RolloutTrainerMixin'):
+        self.trainer = trainer
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if self.trainer.ref_model is None:
+            return
+        if state.global_step % args.ref_model_sync_steps != 0:
+            return
+        self.trainer._sync_ref_model_weights(args.ref_model_mixup_alpha)
+
+
+class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
+    """
+    Mixin for RLHF trainers that use rollout-based methods (e.g., GRPO, GKD).
+
+    This mixin provides vLLM integration and rollout infrastructure.
+    It should be used for trainers that require:
+    - Policy rollout with vLLM engine (server or colocate mode)
+    - Multi-turn dialogue support (GRPO only)
+    - Async generation capabilities (GRPO only)
+    """
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+    def __init__(self,
+                 model: Optional[Union[PreTrainedModel, nn.Module]] = None,
+                 ref_model: Optional[Union[PreTrainedModel, nn.Module]] = None,
+                 *_args,
+                 **kwargs):
+        super().__init__(model, ref_model, *_args, **kwargs)
+        self._is_fsdp2 = getattr(self.accelerator, 'is_fsdp2', False)
+        if self.is_fsdp_enabled and not self._is_fsdp2:
+            raise NotImplementedError('FSDP1 is not supported. Please use FSDP2 (fsdp_version=2) instead. '
+                                      'Set fsdp_version: 2 in your FSDP config or use --fsdp fsdp2')
+        self.args: Union[GRPOConfig, GKDConfig]
+
+    def prepare_rollout(self):
+        self._prepare_rollout_params()
+        self._prepare_scheduler()
+        self._prepare_vllm()
+        self._prepare_async_generate()
+        self.parameter_groups, self.parameter_groups_no_lora = self.split_batches()
+
+    @profiling_decorator
+    def _generate_and_score_completions(self, inputs: DataType) -> List[Dict[str, Any]]:
+        """Unified rollout → score → batch pipeline shared by GRPO and GKD.
+
+        The skeleton fixes the stage order so both algorithms (and future ones)
+        read the same way; per-algorithm behavior lives in the hooks below:
+
+        1. ``_rollout_samples``      – raw rows → samples (+ generation).
+        2. ``_score_completions``    – attach the algorithm's per-sample training
+                                       signal (GRPO: rewards + dynamic sampling; GKD: noop).
+        3. ``_prepare_batch_inputs`` – encode + collate samples into per-micro-batch
+                                       ``{model_inputs, <algo>_batch}`` dicts.
+        4. ``_postprocess_batch``    – fill batch-level signals that depend on the
+                                       encoded batches (GRPO: advantages; GKD: teacher logprobs).
+        5. ``_log_rollout``          – log prompts/completions and extra metrics.
+
+        Returns the list of per-micro-batch encoded inputs.
+        """
+        samples = self._rollout_samples(inputs)
+        samples = self._score_completions(samples)
+        batch_encoded_inputs = self._prepare_batch_inputs(samples)
+        self._postprocess_batch(samples, batch_encoded_inputs)
+        self._log_rollout(samples)
+        return batch_encoded_inputs
+
+    def _rollout_samples(self, inputs: DataType) -> List[OnPolicySample]:
+        """Convert raw rows to samples and (optionally) generate completions.
+
+        Hook overridden by each trainer; GRPO always generates, GKD generates only
+        for the on-policy (STUDENT) branch.
+        """
+        raise NotImplementedError
+
+    def _score_completions(self, samples: List[OnPolicySample]) -> List[OnPolicySample]:
+        """Attach the algorithm's per-sample training signal and return the samples.
+
+        GRPO scores completions with reward functions (and runs DAPO dynamic sampling);
+        GKD has no reward scoring and returns the samples unchanged. Returns samples
+        (rather than a tensor) so the skeleton stays symmetric and resampling can
+        replace the sample set in place.
+        """
+        return samples
+
+    def _prepare_batch_inputs(self, samples: List[OnPolicySample]) -> List[Dict[str, Any]]:
+        """Encode + collate all samples into per-micro-batch ``{model_inputs, <algo>_batch}`` dicts.
+
+        Hook overridden by each trainer; takes all samples and splits internally via
+        ``split_by_mini_batches``.
+        """
+        raise NotImplementedError
+
+    def _postprocess_batch(self, samples: List[OnPolicySample], batch_encoded_inputs: List[Dict[str, Any]]) -> None:
+        """Fill batch-level training signals that depend on the encoded batches.
+
+        Default is a no-op. GRPO computes/writes advantages; GKD fetches/fills teacher logprobs.
+        """
+
+    def _log_rollout(self, samples: List[OnPolicySample]) -> None:
+        """Log prompts/completions and extra rollout metrics. Default no-op."""
+
+    def _pop_teacher_kwargs(self, kwargs: Dict[str, Any]) -> None:
+        """Stash teacher kwargs before ``super().__init__`` consumes them.
+
+        The actual setup (model prepare / API client) runs in ``_setup_teacher`` after the
+        accelerator is ready. ``gkd_logits_topk`` is GKD-only and popped by the GKD trainer.
+        """
+        self._teacher_model = kwargs.pop('teacher_model', None)
+        self._teacher_deepspeed_config = kwargs.pop('teacher_deepspeed_config', None)
+        self.teacher_model_server = kwargs.pop('teacher_model_server', None)
+        self._teacher_use_disable_adapter = kwargs.pop('teacher_use_disable_adapter', False)
+
+    def _has_teacher_explicit(self) -> bool:
+        return (getattr(self, '_teacher_model', None) is not None
+                or getattr(self, 'teacher_model_server', None) is not None
+                or getattr(self, '_teacher_use_disable_adapter', False))
+
+    def _setup_teacher(self) -> None:
+        """Resolve the teacher mode and prepare the local model / API client.
+
+        Sets ``use_teacher_api`` / ``_is_self_distillation`` / ``_has_teacher`` /
+        ``teacher_model`` / ``teacher_client`` / ``is_teacher_ds3``. Must be called after
+        ``super().__init__`` (needs ``self.accelerator``). No-op teacher branches leave
+        ``teacher_model = None`` (API / self-distillation reuse the student weights or server).
+        """
+        teacher_model = getattr(self, '_teacher_model', None)
+        teacher_model_server = getattr(self, 'teacher_model_server', None)
+        self.use_teacher_api = teacher_model_server is not None
+        self._teacher_use_disable_adapter = getattr(self, '_teacher_use_disable_adapter', False)
+        self._is_self_distillation = (teacher_model is None and teacher_model_server is None)
+        explicit = self._has_teacher_explicit()
+        # Dynamic OPD-RL capability (no explicit teacher): student-as-teacher OPSD when a batch
+        # has ``teacher_prompt``; plain reward GRPO skips teacher forwards when OPSD is absent.
+        self._is_dynamic_self_distillation = resolve_dynamic_opd_self_distillation(
+            has_teacher_explicit=explicit,
+            is_self_distillation=self._is_self_distillation,
+        )
+        self._has_teacher = explicit or self._is_dynamic_self_distillation
+
+        self.teacher_clients: List[VLLMInferClient] = []
+        self.teacher_configs: List[TeacherServerConfig] = []
+        if self.use_teacher_api:
+            # Parse teacher config (single URL -> list of 1; JSON -> list of N).
+            self.teacher_configs = parse_teacher_model_server(teacher_model_server)
+            if self.accelerator.is_main_process:
+                self.teacher_clients = [VLLMInferClient(base_urls=[cfg.url]) for cfg in self.teacher_configs]
+
+        self.teacher_ds3_gather_for_generation = getattr(self.args, 'ds3_gather_for_generation', False)
+        self.is_teacher_ds3 = None
+        self.teacher_model = None
+        if teacher_model is not None:
+            teacher_deepspeed_config = getattr(self, '_teacher_deepspeed_config', None)
+            if self.is_deepspeed_enabled:
+                if teacher_deepspeed_config is not None:
+                    self.is_teacher_ds3 = teacher_deepspeed_config.get('zero_optimization', {}).get('stage') == 3
+                    if not self.is_teacher_ds3:
+                        self.teacher_ds3_gather_for_generation = False
+                    self.teacher_model = prepare_deepspeed(
+                        teacher_model,
+                        self.accelerator,
+                        deepspeed_config=teacher_deepspeed_config,
+                        training_args=self.args)
+                else:
+                    self.teacher_model = prepare_deepspeed(teacher_model, self.accelerator)
+            elif self.is_fsdp_enabled:
+                self.teacher_model = prepare_fsdp(teacher_model, self.accelerator)
+            else:
+                self.teacher_model = self.accelerator.prepare_model(teacher_model, evaluation_mode=True)
+            self.teacher_model.eval()
+            if self.args.offload_teacher_model:
+                self.offload_model(self.accelerator.unwrap_model(self.teacher_model))
+
+    @contextmanager
+    def load_teacher_model_context(self):
+        """Load the local teacher to GPU for a forward and offload afterwards (when offloading is on)."""
+        if not self.args.offload_teacher_model or self.teacher_model is None:
+            yield
+            return
+        self.load_model(self.accelerator.unwrap_model(self.teacher_model))
+        try:
+            yield
+        finally:
+            self.offload_model(self.accelerator.unwrap_model(self.teacher_model))
+
+    def _gather_teacher_requests(self, requests: List[Any]) -> Dict[str, Any]:
+        """Phase 1 (all ranks, collective): gather this teacher's requests across DP.
+
+        Returns a handle carrying the flattened global requests (for infer on the main process)
+        and the per-rank counts + this rank's local count (for the later slice). The slice offset
+        is the prefix sum of preceding ranks' counts, not ``rank * n_local``: under multi-teacher
+        routing each rank's routed subset may differ in length, so equal-length slicing misaligns.
+        """
+        n_local = len(requests)
+        all_requests = gather_object(requests)
+        all_counts = gather_object([n_local])  # per-rank counts in rank order
+        return {'all_requests': all_requests, 'all_counts': all_counts, 'n_local': n_local}
+
+    def _infer_teacher_requests(self, handle: Dict[str, Any], topk: int, teacher_client: Optional[Any] = None):
+        """Phase 2 (main process only, no collective): run the teacher HTTP infer.
+
+        Safe to call concurrently across teachers (distinct clients, no collective inside).
+        ``topk == 0`` -> the sampled token's logp (OPD-RL); ``topk > 0`` -> top-k (GKD).
+        """
+        if not handle['all_requests']:  # no sample routed to this teacher: skip the empty HTTP call
+            return []
+        client = teacher_client if teacher_client is not None else self.teacher_clients[0]
+        request_config = RequestConfig(prompt_logprobs=topk, max_tokens=1, temperature=0.0)
+        responses = client.infer(handle['all_requests'], request_config=request_config, use_tqdm=False)
+        return [parse_prompt_logprobs(r, topk=topk) for r in responses]
+
+    def _scatter_teacher_parsed(self, handle: Dict[str, Any], parsed_global):
+        """Phase 3 (all ranks, collective): broadcast the parsed result and slice this rank's part."""
+        container = [parsed_global]
+        broadcast_object_list(container, from_process=0)
+        parsed_global = container[0]
+        rank = self.accelerator.process_index
+        offset = sum(handle['all_counts'][:rank])
+        return parsed_global[offset:offset + handle['n_local']]
+
+    def _fetch_teacher_logprobs(self, requests: List[Any], topk: int, teacher_client: Optional[Any] = None):
+        """Combined gather→infer→broadcast for a single teacher (serial); returns this rank's slice."""
+        handle = self._gather_teacher_requests(requests)
+        parsed_global = self._infer_teacher_requests(handle, topk, teacher_client) \
+            if self.accelerator.is_main_process else None
+        return self._scatter_teacher_parsed(handle, parsed_global)
+
+    def split_by_mini_batches(self, samples: List[OnPolicySample]) -> List[List[OnPolicySample]]:
+        """Split inputs into mini-batches based on steps_per_generation.
+
+        For sequence_parallel_size > 1, gathers inputs across SP/RP groups first,
+        then splits with an adjusted spg that accounts for the parallel world size.
+        Used by both GRPO and GKD trainers.
+        """
+        if self.template.sequence_parallel_size == 1:
+            mode: str = 'train' if self.model.training else 'eval'
+            spg: int = self.args.steps_per_generation if mode == 'train' else 1
+            return self._split_data_by_steps(samples, spg)
+        else:
+            output = [None] * sequence_parallel.sp_world_size
+            dist.all_gather_object(output, samples, group=sequence_parallel.sp_group)
+            if sequence_parallel.rp_world_size > 1:
+                output_rp = [None] * sequence_parallel.rp_world_size
+                samples = [p for sublist in output for p in sublist]
+                dist.all_gather_object(output_rp, output, group=sequence_parallel.rp_group)
+                output = output_rp
+            samples = [p for sublist in output for p in sublist]
+
+            mode = 'train' if self.model.training else 'eval'
+            if mode == 'eval':
+                samples = samples[:self.args.per_device_eval_batch_size]
+                spg = 1
+            else:
+                spg = self.args.steps_per_generation * sequence_parallel.world_size
+
+            spg_chunks = self._split_data_by_steps(samples, spg)
+            return to_device(spg_chunks, device=self.accelerator.device)
+
+    def _prepare_rollout_params(self):
+        """Initialize rollout generation parameters"""
+        args = self.args
+        self.num_generations = args.num_generations if hasattr(args, 'num_generations') else 1
+        self.num_generations_eval = getattr(args, 'num_generations_eval', None) or self.num_generations
+        self.temperature = args.temperature
+        self.vllm_mode = args.vllm_mode
+        self.vllm_gpu_memory_utilization = args.vllm_gpu_memory_utilization
+        self.vllm_tensor_parallel_size = args.vllm_tensor_parallel_size
+        self.max_completion_length = args.max_completion_length
+        self.completion_length_limit_scope = None
+        if hasattr(args, 'completion_length_limit_scope'):  # GRPO colocate
+            self.completion_length_limit_scope = args.completion_length_limit_scope
+        self.async_generate = args.async_generate
+
+        # Enable logprobs for vLLM importance sampling if requested
+        structured_outputs_regex = getattr(args, 'structured_outputs_regex', None)
+
+        self.request_config = RequestConfig(
+            n=1,
+            max_tokens=args.max_completion_length,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            min_p=args.min_p,
+            repetition_penalty=args.repetition_penalty,
+            stop=args.stop_words,
+            return_details=True,
+            logprobs=args.use_vllm,
+            structured_outputs_regex=structured_outputs_regex)
+
+        self.disable_rollout_importance_sampling = False
+
+    def _prepare_vllm(self):
+        """Initialize vLLM engine (server or colocate mode)"""
+        args = self.args
+        self.use_fast_infer = args.use_vllm
+        # Initialize default values
+        self.enable_offload = False
+        self.use_gym_env = False
+        self.enable_server_multi_turn = False
+        self.rollout_enable_lora = False
+        self.vllm_use_async_engine = False
+        self.vllm_version_ge_0_10_2 = check_vllm_version_ge('0.10.2')
+        self.disable_rollout_importance_sampling = not self.vllm_version_ge_0_10_2
+        # for multi-turn server, maybe the num of rollout outputs is not equal to the num of rollout inputs
+        self.dynamic_num_samples = False
+        self.base_sync_done = False
+        self._last_loaded_step = -1  # tag to avoid useless loading during grad accumulation
+        self._cached_vllm_param_names = None
+        # split model parameters into batches for synchronized weight transfer / ref sync
+        if not args.use_vllm:
+            infer_template = copy(self.template)
+            infer_template.padding_free = False
+            infer_template.sequence_parallel_size = 1
+            infer_template.remove_unused_columns = True
+            self.engine = TransformersEngine(self.model, template=infer_template, max_batch_size=0)
+            return
+
+        if not is_vllm_available():
+            raise ImportError('vLLM is not available and `use_vllm` is set to True. '
+                              'Please install vLLM with `pip install vllm -U` to use it.')
+
+        if is_torch_npu_available():
+            from swift.model.npu_patch.vllm_ascend import validate_vllm_ascend_lora_training
+            validate_vllm_ascend_lora_training(self.model, args)
+
+        if not self.vllm_version_ge_0_10_2 and getattr(self.args, 'rollout_importance_sampling_mode', None) is not None:
+            raise ValueError('rollout_importance_sampling_mode is not supported in vLLM version < 0.10.2, '
+                             'please update vLLM to 0.10.2 or later.')
+
+        explicit_use_gym_env = getattr(args, 'use_gym_env', None)
+        if explicit_use_gym_env is not None:
+            self.use_gym_env = bool(explicit_use_gym_env)
+
+        if self.vllm_mode == 'server':
+            if self.accelerator.is_main_process:
+                self.vllm_client.get_engine_type()
+                self.vllm_client.reset_mm_cache()
+                vllm_use_async_engine = [self.vllm_client.use_async_engine]
+                enable_multi_turn = [self.vllm_client.enable_multi_turn]
+                enable_lora = [self.vllm_client.enable_lora]
+                # Only inherit use_gym_env from rollout server when the trainer hasn't set it explicitly.
+                use_gym_env = [self.vllm_client.use_gym_env] if explicit_use_gym_env is None else [self.use_gym_env]
+            else:
+                vllm_use_async_engine = [False]
+                enable_multi_turn = [self.enable_server_multi_turn]
+                enable_lora = [False]
+                use_gym_env = [self.use_gym_env]
+            self.vllm_use_async_engine = broadcast_object_list(vllm_use_async_engine, from_process=0)[0]
+            self.use_gym_env = broadcast_object_list(use_gym_env, from_process=0)[0]
+            self.enable_server_multi_turn = broadcast_object_list(enable_multi_turn, from_process=0)[0]
+            self.rollout_enable_lora = broadcast_object_list(enable_lora, from_process=0)[0]
+
+        elif self.vllm_mode == 'colocate':
+            if not self.accelerator.num_processes % self.vllm_tensor_parallel_size == 0:
+                raise ValueError(f'vllm_tensor_parallel_size ({self.vllm_tensor_parallel_size}) must divide world size '
+                                 f'({self.accelerator.num_processes}) evenly.')
+
+            if self.vllm_tensor_parallel_size > 1:
+                self.tp_group, _ = torch.distributed.new_subgroups_by_enumeration([
+                    list(range(i * self.vllm_tensor_parallel_size, (i + 1) * self.vllm_tensor_parallel_size))
+                    for i in range(self.accelerator.num_processes // self.vllm_tensor_parallel_size)
+                ])
+            self.enable_offload = args.offload_model or args.offload_optimizer
+            # At init (prepare_rollout, before accelerator.prepare()) an FSDP2
+            # model is still full-sized on CPU — sharding hasn't happened yet.
+            # Skip the offload context entirely: both the offload and the reload
+            # are pointless here, and reloading the full model onto a single card
+            # would OOM. train()'s accelerator.prepare() will shard and load it.
+            if self.enable_offload and not self._is_fsdp2:
+                rollout_cm = self.offload_context()
+            else:
+                rollout_cm = nullcontext()
+
+            with rollout_cm, self._disable_sp_context():
+                self.engine = self._prepare_vllm_engine()
+                self.engine.engine.reset_mm_cache()
+                if args.sleep_level > 0:
+                    self.engine.engine.sleep(args.sleep_level)
+
+    def _prepare_vllm_engine(self):
+        """Create and configure vLLM engine for colocate mode"""
+        from swift.infer_engine import GRPOVllmEngine
+        args = self.args
+        model = self.model
+        steps_per_generation = args.steps_per_generation if hasattr(args, 'steps_per_generation') else 1
+        per_rollout_batch_size = args.per_device_train_batch_size * self.vllm_tensor_parallel_size
+        max_num_seqs = args.vllm_max_num_seqs or (per_rollout_batch_size * steps_per_generation)
+        vllm_template = copy(self.template)
+        vllm_template.padding_free = False
+        vllm_template.sequence_parallel_size = 1
+        lora_kwargs = {}
+        is_moe = model.model_info.is_moe_model
+        vllm_enable_lora = args.vllm_enable_lora
+
+        if args.tuner_type == 'lora' and vllm_enable_lora:
+            lora_kwargs = {
+                'enable_lora': args.vllm_enable_lora,
+                'max_loras': 1,
+                'max_lora_rank': args.lora_rank,
+            }
+            self.rollout_enable_lora = True
+
+            if is_moe:
+                logger.warning(
+                    'vLLM LoRA is enabled for an MoE model. This may cause errors when applying LoRA to expert layers, '
+                    'as vLLM currently does not support LoRA in MoE configurations. If you encounter errors, '
+                    'please set vllm_enable_lora to False.')
+
+            if self.is_multimodal:
+                logger.warning('vLLM LoRA is enabled for a multimodal model. This may lead to unexpected issues '
+                               'when applying LoRA to the ViT component, as vLLM does not yet support this setup. '
+                               'If errors occur, please disable LoRA by setting vllm_enable_lora to False.')
+
+            patch_vllm_load_adapter()
+
+        vllm_quantization = None
+        if model.model_info.quant_method == 'bnb' and model.model_info.quant_bits == 4:
+            vllm_quantization = 'bitsandbytes'
+
+        logprobs_mode = 'processed_logprobs' if self.vllm_version_ge_0_10_2 else None
+
+        with Swift.grpo_context(model, self.template.processor):
+            set_expandable_segments(False)
+            # Use load_format from vllm_engine_kwargs if provided, otherwise default to 'auto'
+            vllm_engine_kwargs = self.args.vllm_engine_kwargs or {}
+            load_format = vllm_engine_kwargs.pop('load_format', 'auto')
+            engine = GRPOVllmEngine(
+                model.model_dir,
+                torch_dtype=model.model_info.torch_dtype,
+                model_type=model.model_meta.model_type,
+                use_async_engine=False,
+                tensor_parallel_size=self.vllm_tensor_parallel_size,
+                gpu_memory_utilization=self.vllm_gpu_memory_utilization,
+                enable_prefix_caching=args.vllm_enable_prefix_caching,
+                max_num_seqs=max_num_seqs,
+                enforce_eager=args.vllm_enforce_eager,
+                limit_mm_per_prompt=args.vllm_limit_mm_per_prompt,
+                enable_sleep_mode=args.sleep_level > 0,
+                max_model_len=args.vllm_max_model_len,
+                seed=self.accelerator.process_index // self.vllm_tensor_parallel_size,
+                disable_cascade_attn=args.vllm_disable_cascade_attn,
+                load_format=load_format,
+                mm_processor_cache_gb=args.vllm_mm_processor_cache_gb,
+                template=vllm_template,
+                distributed_executor_backend='external_launcher',
+                engine_kwargs=vllm_engine_kwargs,
+                logprobs_mode=logprobs_mode,
+                quantization=vllm_quantization,
+                **lora_kwargs,
+            )
+            set_expandable_segments(True)
+
+        return engine
+
+    def split_batches(self):
+        """Split model parameters into batches for synchronized weight transfer.
+
+        This method divides model parameters into manageable batches to facilitate efficient
+        weight synchronization between vLLM and DeepSpeed. The splitting strategy focuses on
+        LLM layers while grouping other components separately.
+
+        Batching Strategy:
+            1. LLM layers: Split into N batches based on layer indices (configurable via args.move_model_batches)
+            2. Embeddings and LM heads: Grouped into a single batch
+            3. Multi-modal components (e.g., vision tower): Grouped into a single batch
+
+        Returns:
+            tuple[list[list[str]], list[list[str]]]: A tuple containing two lists:
+                - First list: Batches of parameter names (with original prefixes and LoRA layers)
+                - Second list: Batches of parameter names with LoRA layers removed and prefixes stripped
+                  (for vLLM compatibility). Contains None if no batching is configured.
+
+        Notes:
+            - If args.move_model_batches is None, all parameters are returned in a single batch
+            - Reference model parameters (containing 'ref_model') are excluded from batching
+            - For multi-modal models, components are identified using model_arch metadata
+            - LoRA layers are filtered based on the rollout_enable_lora flag
+
+        Raises:
+            AssertionError: If no ModuleList is found in the model to determine layer count
+        """
+        model = self.accelerator.unwrap_model(self.model)
+        args = self.args
+
+        if args.move_model_batches is None:
+            return [[n for n, p in model.named_parameters() if 'ref_model' not in n]], [None]
+
+        model_arch = model.model_meta.model_arch
+        non_llm_parameters = []
+        llm_embeds = []
+        parameters = []
+        pattern = r'\.(\d+)\.'
+
+        layer_count = None
+        for name, module in model.named_modules():
+            if isinstance(module, ModuleList):
+                if model_arch is not None and isinstance(model_arch, MultiModelKeys):
+                    llm = model_arch.language_model
+                    vision_tower = model_arch.vision_tower
+                    if any(vt in name for vt in vision_tower):
+                        continue
+                    if isinstance(llm, list):
+                        llm = llm[0]
+                    if name.startswith('base_model'):
+                        name = name.replace('base_model.', '')
+                    if llm in name:
+                        layer_count = len(module)
+                else:
+                    layer_count = len(module)
+        assert layer_count is not None, 'Cannot find ModuleList to split modules.'
+
+        n_layers = ceil(layer_count / args.move_model_batches)
+        for _ in range(args.move_model_batches):
+            parameters.append([])
+
+        def replace_lora(name):
+            if 'lora_' in name:
+                return ''
+            else:
+                if not self.rollout_enable_lora:
+                    return name.replace('.base_layer', '')
+                else:
+                    return name
+
+        def remove_lora_and_prefix(names):
+            names = set([re.sub(r'^_model\.', '', replace_lora(n)) for n in names])
+            return [n for n in names if n]
+
+        def split_llm(name):
+            match = re.search(pattern, name)
+            if match:
+                number = match.group(1)
+                group = int(number) // n_layers
+                parameters[group].append(name)
+            else:
+                llm_embeds.append(name)
+
+        for name, parameter in model.named_parameters():
+            if 'ref_model' in name:
+                continue
+            if model_arch is not None and isinstance(model_arch, MultiModelKeys):
+                llm = model_arch.language_model
+                vision_tower = model_arch.vision_tower
+                if any(vt in name for vt in vision_tower):
+                    non_llm_parameters.append(name)
+                elif isinstance(llm, list):
+                    llm = llm[0]
+                    if llm in name:
+                        split_llm(name)
+                    else:
+                        non_llm_parameters.append(name)
+            else:
+                split_llm(name)
+
+        if llm_embeds:
+            parameters.append(llm_embeds)
+        if non_llm_parameters:
+            parameters.append(non_llm_parameters)
+        parameters = [p for p in parameters if p]
+        parameters_no_lora = [remove_lora_and_prefix(p_list) for p_list in parameters]
+        return parameters, parameters_no_lora
+
+    @profiling_decorator
+    def _move_model_to_vllm(self, skip_async_check=False):
+        """Synchronize model weights to vLLM engine"""
+        args = self.args
+
+        if args.async_generate and not skip_async_check:
+            self._wait_queue()
+
+        tuner_type = args.tuner_type
+
+        if tuner_type == 'full' or (not self.base_sync_done or args.sleep_level == 2) or not self.rollout_enable_lora:
+            self._move_full_model_to_vllm()
+        else:
+            self._move_adapter_to_vllm()
+
+        self._reset_vllm_cache()
+
+    def _reset_vllm_cache(self):
+        # Reset prefix cache and encoder cache after weight update
+        vllm_ge_16 = check_vllm_version_ge('0.16')
+        if self.vllm_mode == 'server' and self.accelerator.is_main_process:
+            self.vllm_client.reset_prefix_cache()
+            if vllm_ge_16:
+                self.vllm_client.reset_encoder_cache()
+        elif self.vllm_mode == 'colocate':
+            self.engine.engine.reset_prefix_cache()
+            if vllm_ge_16:
+                self.engine.engine.reset_encoder_cache()
+
+    def _move_adapter_to_vllm(self):
+        """Transfer LoRA adapter weights to vLLM engine"""
+        lora_params = OrderedDict()
+        gather_if_zero3 = get_gather_if_zero3_context(self)
+        peft_config = self.model.peft_config.get('default', None)
+
+        for i, parameter_group in enumerate(self.parameter_groups):
+            if not self._is_fsdp2:
+                parameters = [
+                    parameter for name, parameter in self.model.named_parameters()
+                    if not parameter_group or name in parameter_group
+                ]
+            else:
+                parameters = []
+
+            with gather_if_zero3(parameters), patch_lora_merge(self.model, parameter_group):
+                if not self._is_fsdp2:
+                    assert len(parameters) == len(parameter_group)
+                    state_dict = {name: p for p, name in zip(parameters, parameter_group)}
+                else:
+                    state_dict = {
+                        k: v
+                        for k, v in self.model.state_dict().items()
+                        if k in parameter_group or k.removeprefix('base_model.model.') in parameter_group
+                    }
+
+                if not self._is_fsdp2:
+                    self.model.merge_adapter()
+                cur_lora_params = get_peft_model_state_dict(self.model, state_dict)
+                for name, param in cur_lora_params.items():
+                    if hasattr(param, 'full_tensor'):
+                        if param.is_cpu:
+                            param = param.to(get_current_device())
+                        param = param.full_tensor()
+                    cur_lora_params[name] = param.detach()
+                lora_params.update(cur_lora_params)
+                if not self._is_fsdp2:
+                    with patch_lora_unmerge(self.model):
+                        self.model.unmerge_adapter()
+                del cur_lora_params
+
+        if self.vllm_mode == 'server' and self.accelerator.is_main_process:
+            use_flatten = getattr(self.args, 'enable_flattened_weight_sync', True)
+            if use_flatten:
+                bucket = FlattenedTensorBucket(named_tensors=list(lora_params.items()))
+                metadatas = bucket.get_metadata()
+                flattened_tensor = bucket.get_flattened_tensor()
+                self.vllm_client.update_adapter_flattened_param(peft_config, metadatas, flattened_tensor)
+            else:
+                self.vllm_client.update_adapter_param(peft_config, lora_params)
+        elif self.vllm_mode == 'colocate':
+            req_kw = {
+                'lora_name': VLLM_LORA_NAME,
+                'lora_int_id': VLLM_LORA_INT_ID,
+                'lora_path': VLLM_LORA_PATH,
+                'peft_config': asdict(peft_config),
+                'lora_tensors': lora_params,
+            }
+            if vllm_supports_lora_load_inplace():
+                req_kw['load_inplace'] = True
+            lora_request = TensorLoRARequest(**req_kw)
+            self.engine.engine.add_lora(lora_request)
+        del lora_params
+
+    def _get_vllm_param_names_for_mapping(self):
+        """Get vLLM runtime parameter names for base_layer mapping.
+
+        Returns an alias-expanded set so bridge/HF names can match vLLM packed names.
+        """
+        if self.vllm_mode == 'colocate':
+            llm_model = self.engine.inner_model
+            raw_names = set(dict[Any, Any](llm_model.named_parameters()).keys())
+            return expand_vllm_param_name_aliases(raw_names)
+
+        if self.vllm_mode != 'server' or not self.accelerator.is_main_process:
+            return None
+
+        if self._cached_vllm_param_names is None:
+            keys = self.vllm_client.get_model_state_keys()
+            self._cached_vllm_param_names = expand_vllm_param_name_aliases(set(keys))
+        return self._cached_vllm_param_names
+
+    def _load_state_dict_to_vllm(self, state_dict):
+        if self.rollout_enable_lora:
+            vllm_param_names = self._get_vllm_param_names_for_mapping()
+            if vllm_param_names:
+                state_dict = dict(add_base_layer_suffix_by_param_names(state_dict.items(), vllm_param_names))
+
+        if self.vllm_mode == 'server' and self.accelerator.is_main_process:
+            use_flatten = getattr(self.args, 'enable_flattened_weight_sync', True)
+            if use_flatten:
+                bucket_size_mb = int(os.environ.get('SWIFT_UPDATE_WEIGHTS_BUCKET_SIZE', 512))
+                named_params = list(state_dict.items())
+                parameter_buckets = _create_parameter_buckets(named_params, bucket_size_mb=bucket_size_mb)
+                for bucket in parameter_buckets:
+                    _process_bucket_with_flattened_tensor(self, bucket)
+                del named_params, parameter_buckets
+            else:
+                for name, param in state_dict.items():
+                    self.vllm_client.update_named_param(name, param)
+        elif self.vllm_mode == 'colocate':
+            llm_model = self.engine.inner_model
+            llm_model.load_weights(state_dict.items())
+        del state_dict
+
+    def _fix_param_name_to_vllm(self, name: str, extra_prefixes: Optional[List[str]] = None) -> str:
+        extra_prefixes = extra_prefixes or []
+        prefixes = ['_checkpoint_wrapped_module.'] + extra_prefixes
+        for prefix in prefixes:
+            name = name.replace(prefix, '')
+        return name
+
+    def _process_state_dict_for_vllm(self,
+                                     state_dict: Dict[str, Any],
+                                     is_peft: bool,
+                                     keep_lora_weights: bool = False) -> Dict[str, Any]:
+        """Process state dict for vLLM: clean names, filter adapter layers, convert DTensor.
+
+        Args:
+            state_dict: Raw state dict from model
+            is_peft: Whether the model is a PEFT model
+            keep_lora_weights: If True, keep LoRA weights for later tensor-level merge (FSDP2)
+
+        Returns:
+            Processed state dict ready for vLLM
+        """
+        processed = {}
+        expand_fused_moe_expert_weight = None
+        if is_torch_npu_available():
+            from swift.model.npu_patch.vllm_ascend_moe import expand_fused_moe_expert_weight_for_vllm_ascend
+            expand_fused_moe_expert_weight = expand_fused_moe_expert_weight_for_vllm_ascend
+        for name, param in state_dict.items():
+            # Clean up parameter name for PEFT models
+            clean_name = name.removeprefix('base_model.model.')
+            # Only remove .base_layer when vLLM LoRA is disabled
+            # When vLLM LoRA is enabled, the model params have .base_layer suffix
+            if not self.rollout_enable_lora:
+                clean_name = clean_name.replace('.base_layer', '')
+
+            # Skip PEFT adapter layers (unless we need to keep them for later merge)
+            if is_peft and not keep_lora_weights and self.model.prefix in clean_name:
+                continue
+
+            # Skip original_module entries when modules_to_save is used
+            if 'original_module' in clean_name:
+                continue
+
+            # Fix checkpoint wrapper prefixes
+            clean_name = self._fix_param_name_to_vllm(clean_name)
+            clean_name = clean_name.replace('modules_to_save.default.', '')
+
+            # Convert DTensor to regular Tensor if needed (FSDP2)
+            if hasattr(param, 'full_tensor'):
+                if param.is_cpu:
+                    param = param.to(get_current_device())
+                param = param.full_tensor()
+
+            if expand_fused_moe_expert_weight is not None:
+                expanded_moe_weights = expand_fused_moe_expert_weight(clean_name, param)
+                if expanded_moe_weights is not None:
+                    processed.update(expanded_moe_weights)
+                    continue
+
+            processed[clean_name] = param
+
+        return processed
+
+    def _merge_lora_into_state_dict(self, state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Merge LoRA weights into base weights at tensor level.
+
+        This is needed for FSDP2 where PEFT's merge_adapter()/unmerge_adapter() don't work
+        correctly with DTensor - unmerge fails to properly restore original weights.
+
+        Args:
+            state_dict: State dict with base weights and LoRA weights (already converted from DTensor)
+
+        Returns:
+            State dict with LoRA weights merged into base weights, adapter keys removed
+        """
+        from peft.tuners.lora import LoraLayer
+
+        merged = {}
+        lora_keys = set()
+
+        # Find all LoRA modules and compute delta weights
+        for name, module in self.model.named_modules():
+            if not isinstance(module, LoraLayer):
+                continue
+
+            # Get the base layer key in state_dict
+            base_name = name.removeprefix('base_model.model.')
+            if not self.rollout_enable_lora:
+                base_name = base_name.replace('.base_layer', '')
+            base_name = self._fix_param_name_to_vllm(base_name)
+            weight_key = f'{base_name}.weight'
+
+            if weight_key not in state_dict:
+                continue
+
+            active_adapter = module.active_adapter
+            if isinstance(active_adapter, list):
+                active_adapter = active_adapter[0] if active_adapter else 'default'
+
+            if active_adapter not in module.lora_A:
+                continue
+
+            # Get LoRA weights from state_dict (already converted from DTensor)
+            lora_a_key = f'{base_name}.lora_A.{active_adapter}.weight'
+            lora_b_key = f'{base_name}.lora_B.{active_adapter}.weight'
+
+            if lora_a_key not in state_dict or lora_b_key not in state_dict:
+                continue
+
+            lora_A = state_dict[lora_a_key]
+            lora_B = state_dict[lora_b_key]
+            scaling = module.scaling[active_adapter]
+
+            lora_keys.add(lora_a_key)
+            lora_keys.add(lora_b_key)
+
+            base_weight = state_dict[weight_key]
+            delta_weight = (lora_B @ lora_A) * scaling
+            merged[weight_key] = base_weight + delta_weight.to(base_weight.dtype)
+
+        # Copy non-LoRA keys and non-merged base weights
+        for key, value in state_dict.items():
+            if key in lora_keys:
+                continue  # Skip LoRA adapter weights
+            if key in merged:
+                continue  # Already merged
+            if self.model.prefix in key:
+                continue  # Skip other adapter keys
+            merged[key] = value
+
+        return merged
+
+    def _collect_state_dict_for_vllm(self, parameter_group=None, parameter_group_no_lora=None):
+        """Collect state dict for vLLM synchronization.
+
+        This method only collects parameters without merge/unmerge.
+        Caller is responsible for merge/unmerge and gather context.
+
+        Args:
+            parameter_group: Optional parameter group to filter
+            parameter_group_no_lora: Optional parameter group without LoRA names
+
+        Returns:
+            State dict ready for vLLM
+        """
+        is_peft = is_peft_model(self.model)
+        should_merge_lora = self._is_fsdp2 and is_peft and not self.rollout_enable_lora
+
+        raw_state_dict = {}
+        if self._is_fsdp2:
+            # FSDP2: must use state_dict() (named_parameters returns sharded values)
+            # Keep LoRA weights for tensor-level merge later
+            for name, param in self.model.state_dict().items():
+                if parameter_group and name not in parameter_group:
+                    continue
+                if hasattr(param, 'full_tensor'):
+                    if param.is_cpu:
+                        param = param.to(get_current_device())
+                    param = param.full_tensor()
+                raw_state_dict[name] = param
+        else:
+            # DeepSpeed: use named_parameters + param.data
+            # No clone needed: unmerge happens after _load_state_dict_to_vllm completes
+            for name, param in self.model.named_parameters():
+                if parameter_group and name not in parameter_group:
+                    continue
+                raw_state_dict[name] = param.data
+
+        # Process: clean names, filter adapters (keep LoRA for FSDP2 to merge at tensor level)
+        state_dict = self._process_state_dict_for_vllm(raw_state_dict, is_peft, keep_lora_weights=should_merge_lora)
+
+        # FSDP2 + LoRA: merge at tensor level (avoids issues with merge/unmerge on DTensor)
+        if should_merge_lora:
+            state_dict = self._merge_lora_into_state_dict(state_dict)
+
+        # Filter by parameter_group_no_lora
+        if parameter_group_no_lora:
+            if is_peft:
+                parameter_group_no_lora = [n.replace('base_model.model.', '') for n in parameter_group_no_lora]
+            parameter_group_no_lora = set(parameter_group_no_lora)
+            if is_torch_npu_available():
+                from swift.model.npu_patch.vllm_ascend_moe import expand_fused_moe_expert_names_for_vllm_ascend
+                for name in tuple(parameter_group_no_lora):
+                    expanded_names = expand_fused_moe_expert_names_for_vllm_ascend(name)
+                    if expanded_names is not None:
+                        parameter_group_no_lora.update(expanded_names)
+            state_dict = {k: v for k, v in state_dict.items() if k in parameter_group_no_lora}
+
+        if is_peft:
+            assert len(state_dict) > 0 and all([state.shape != torch.Size([0]) for state in state_dict.values()])
+
+        # Revert transformers runtime param names back to checkpoint names so vLLM's
+        # hf_to_vllm_mapper (built for checkpoint names) maps them correctly. Fixes
+        # online weight sync for models like gemma4_unified where runtime names differ
+        # from checkpoint names (transformers>=5 conversion mapping). No-op otherwise.
+        state_dict = revert_runtime_names_to_checkpoint(self.accelerator.unwrap_model(self.model), state_dict)
+
+        return state_dict
+
+    def _move_full_model_to_vllm(self):
+        """Transfer full model weights to vLLM engine.
+
+        Manages the lifecycle of gather and merge/unmerge per parameter_group:
+        - gather_if_zero3: per parameter_group batch (DeepSpeed Zero3)
+        - merge/unmerge: per parameter_group (must be within gather context)
+        - No clone needed: unmerge happens after load completes
+        """
+        is_peft = is_peft_model(self.model)
+        should_merge = is_peft and not self._is_fsdp2 and not self.rollout_enable_lora
+
+        gather_if_zero3 = get_gather_if_zero3_context(self)
+
+        ascend_reload_runner = None
+        if self.vllm_mode == 'colocate' and is_torch_npu_available():
+            from swift.model.npu_patch.vllm_ascend import get_vllm_ascend_reload_runner
+            ascend_reload_runner = get_vllm_ascend_reload_runner(self.engine)
+        if self.vllm_mode == 'colocate':
+            if ascend_reload_runner is None:
+                # Legacy vLLM-Ascend and GPU keep the existing in-place reload
+                # path. The Ascend fallback loader writes directly into the
+                # processed MoE layout and guards its redundant post-load.
+                patch_vllm_moe_model_weight_loader(self.engine.inner_model)
+
+        def iter_state_dicts():
+            for i, parameter_group in enumerate(self.parameter_groups):
+                parameter_group_no_lora = self.parameter_groups_no_lora[i]
+
+                if not self._is_fsdp2:
+                    parameters = [
+                        parameter for name, parameter in self.model.named_parameters()
+                        if not parameter_group or name in parameter_group
+                    ]
+                else:
+                    parameters = []
+
+                with gather_if_zero3(parameters):
+                    if should_merge:
+                        with patch_lora_merge(self.model, parameter_group):
+                            self.model.merge_adapter()
+
+                    try:
+                        yield self._collect_state_dict_for_vllm(parameter_group, parameter_group_no_lora)
+                    finally:
+                        if should_merge:
+                            with patch_lora_unmerge(self.model):
+                                self.model.unmerge_adapter()
+
+        state_dicts = iter_state_dicts()
+        if ascend_reload_runner is not None:
+
+            def iter_weights():
+                for state_dict in state_dicts:
+                    yield from state_dict.items()
+
+            weights = iter_weights()
+            try:
+                ascend_reload_runner.reload_weights(weights_iterator=weights, is_checkpoint_format=True)
+            finally:
+                weights.close()
+                state_dicts.close()
+        else:
+            try:
+                for state_dict in state_dicts:
+                    self._load_state_dict_to_vllm(state_dict)
+            finally:
+                state_dicts.close()
+
+        # Re-run process_weights_after_loading once after ALL groups loaded
+        if self.vllm_mode == 'colocate' and ascend_reload_runner is None:
+            _model_config = self.engine.engine.model_config
+            llm_model = self.engine.inner_model
+            finish_vllm_weight_reload(llm_model, model_config=_model_config, target_device=self.accelerator.device)
+        elif self.vllm_mode == 'server' and self.accelerator.is_main_process:
+            self.vllm_client.process_weights_after_loading()
+
+        if is_peft:
+            self.base_sync_done = True
+            if self.rollout_enable_lora:
+                self._move_adapter_to_vllm()
+
+    @torch.no_grad()
+    def _sync_ref_model_weights(self, alpha: float) -> None:
+        policy = self.accelerator.unwrap_model(self.model)
+        ref = self.accelerator.unwrap_model(self.ref_model)
+        policy_named = dict(policy.named_parameters())
+        ref_named = dict(ref.named_parameters())
+
+        deepspeed_plugin = self.accelerator.state.deepspeed_plugin
+        zero3 = deepspeed_plugin is not None and deepspeed_plugin.zero_stage == 3
+
+        def _mix_inplace(ref_p: torch.Tensor, pol_p: torch.Tensor) -> None:
+            ref_p.data.mul_(1.0 - alpha).add_(pol_p.data, alpha=alpha)
+
+        if zero3:
+            import deepspeed
+
+        for parameter_group in self.parameter_groups:
+            names = [n for n in (parameter_group or []) if n in policy_named]
+            if not names:
+                continue
+
+            params_to_update = []
+            for n in names:
+                if n not in ref_named:
+                    raise KeyError(f'sync_ref: ref has no parameter {n!r}; policy and ref must align.')
+                params_to_update.append((ref_named[n], policy_named[n]))
+
+            if zero3:
+                ref_params = [p[0] for p in params_to_update]
+                policy_params = [p[1] for p in params_to_update]
+                to_gather = policy_params + ref_params
+                # modifier_rank=0 matches TRL; only rank 0 applies the mix inside GatheredParameters.
+                with deepspeed.zero.GatheredParameters(to_gather, modifier_rank=0):
+                    if deepspeed.comm.get_rank() == 0:
+                        for rp, pp in params_to_update:
+                            _mix_inplace(rp, pp)
+            else:
+                for rp, pp in params_to_update:
+                    _mix_inplace(rp, pp)
+
+    def _rollout(self,
+                 samples: List[OnPolicySample],
+                 request_config: RequestConfig,
+                 is_global_inputs: bool = False) -> List[RolloutOutput]:
+        """Execute rollout using vLLM server or colocate mode"""
+        request_config = self._get_request_config()
+        if self.vllm_mode == 'server':
+            rollout_outputs = self._server_rollout(samples, request_config, is_global_inputs)
+        else:
+            rollout_outputs = self._colocate_rollout(samples, request_config)
+        return rollout_outputs
+
+    def _get_request_config(self) -> RequestConfig:
+        """Get request config with proper seed for distributed TP groups"""
+        request_config = copy(self.request_config)
+        args = self.args
+
+        if args.vllm_mode == 'colocate' and self.vllm_tensor_parallel_size > 1:
+            mode = 'train' if self.model.training else 'eval'
+            batch_size = (
+                args.per_device_train_batch_size
+                * args.gradient_accumulation_steps if mode == 'train' else args.per_device_eval_batch_size)
+            batch_size *= self.vllm_tensor_parallel_size
+            request_config.seed = batch_size * (self.accelerator.process_index // self.vllm_tensor_parallel_size)
+
+        return request_config
+
+    def _infer_single_or_multi_turn(self,
+                                    samples: List[OnPolicySample],
+                                    request_config: RequestConfig,
+                                    is_global_inputs: bool = False) -> List[OnPolicySample]:
+        if not self.multi_turn_scheduler or self.enable_server_multi_turn:
+            rollout_outputs: List[RolloutOutput] = self._rollout(samples, request_config, is_global_inputs)
+            return self._postprocess_rollout_outputs(samples, rollout_outputs)
+
+        # Multi-turn: call on_trajectory_start BEFORE first turn generation
+        # so the model sees the actual environment question, not the placeholder.
+        requests = self.samples2requests(samples)
+        invoke_async_hook(self.multi_turn_scheduler.on_trajectory_start(requests))
+
+        # Update inputs with actual messages from requests (e.g. env question)
+        for req, sample in zip(requests, samples):
+            sample.messages = req.messages
+
+        # Generate first turn with actual questions
+        first_turn_rollout_outputs: List[RolloutOutput] = self._rollout(samples, request_config, is_global_inputs)
+
+        return self._colocate_multi_turn_infer(samples, first_turn_rollout_outputs, request_config, requests)
+
+    def _colocate_multi_turn_infer(self,
+                                   samples: List[OnPolicySample],
+                                   first_turn_rollout_outputs: List[RolloutOutput],
+                                   request_config: RequestConfig,
+                                   requests: Optional[List] = None) -> List[OnPolicySample]:
+        if requests is None:
+            requests = self.samples2requests(samples)
+        rollout_outputs = run_multi_turn(
+            requests=requests,
+            first_turn_outputs=first_turn_rollout_outputs,
+            scheduler=self.multi_turn_scheduler,
+            rollout_fn=lambda reqs, cfg: self._rollout(reqs, cfg),
+            request_config=request_config,
+            max_turns=self.args.max_turns,
+            gather_fn=gather_object,
+        )
+        return self._postprocess_rollout_outputs(samples, rollout_outputs)
+
+    def _generate_completions(self, samples: List[OnPolicySample]) -> List[OnPolicySample]:
+        # add prompt ids and system prompts
+        samples = self._preprocess_inputs(samples)
+
+        mode = 'train' if self.model.training else 'eval'
+        if self.use_fast_infer:
+            samples = self._fast_infer(samples)
+        else:
+            with unwrap_model_for_generation(
+                    self.model_wrapped, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
+            ), self.template.generate_context(), self.multi_turn_completion_length_context():
+                samples = self._infer_single_or_multi_turn(samples, self.request_config)
+                if mode == 'train':
+                    # In training mode, ensure the model is returned to train() mode after inference
+                    # This is necessary as transformers engines set the model to eval mode during generation
+                    self.model.train()
+
+        return samples
+
+    def _fast_infer(self, samples: List[OnPolicySample]) -> List[OnPolicySample]:
+        """Efficient inference with vLLM colocate mode support"""
+        args = self.args
+        assert isinstance(args, RolloutTrainerArgumentsMixin)
+
+        if self.vllm_mode == 'colocate' and args.sleep_level > 0:
+            if self.engine.inner_model_executor.is_sleeping:
+                wake_up_params = inspect.signature(self.engine.engine.wake_up).parameters
+                kwargs = {'tags': ['weights']} if 'tags' in wake_up_params else {}
+                aggressive_empty_cache()
+                self.engine.engine.wake_up(**kwargs)
+
+        if self.state.global_step != self._last_loaded_step or args.sleep_level == 2:
+            self._move_model_to_vllm()
+            self._last_loaded_step = self.state.global_step
+
+        context = self.offload_context if self.enable_offload else nullcontext
+        with context():
+
+            if (self.vllm_mode == 'colocate' and self.engine.inner_model_executor.is_sleeping
+                    and 'tags' in inspect.signature(self.engine.engine.wake_up).parameters):
+                aggressive_empty_cache()
+                set_expandable_segments(False)
+                self.engine.engine.wake_up(tags=['kv_cache'])
+
+            if hasattr(self, 'async_generate') and self.async_generate:
+                all_inputs = gather_object(samples)
+                self.async_generate_rollout(all_inputs)
+
+                data_cache = self._queue.get()
+                all_outputs = gather_object(data_cache.results)
+
+                per_device_datasize = len(all_outputs) // self.accelerator.num_processes
+                process_slice = slice(
+                    self.accelerator.process_index * per_device_datasize,
+                    (self.accelerator.process_index + 1) * per_device_datasize,
+                )
+                outputs = all_outputs[process_slice]
+
+            else:
+                with self.multi_turn_completion_length_context():
+                    outputs = self._infer_single_or_multi_turn(samples, self.request_config)
+
+            if self.vllm_mode == 'colocate' and args.sleep_level > 0:
+                self.engine.engine.reset_prefix_cache()
+                self.engine.engine.sleep(level=args.sleep_level)
+                aggressive_empty_cache()
+                set_expandable_segments(True)
+        return outputs
+
+    def _preprocess_inputs(self, samples: List[OnPolicySample]) -> List[OnPolicySample]:
+        """Preprocess samples before inference"""
+        samples = self._set_inputs_system(samples)
+        samples = self._add_prompt_id_to_inputs(samples)
+        for s in samples:
+            remove_response(s.messages)
+        return samples
+
+    def _add_prompt_id_to_inputs(self, samples: List[OnPolicySample]) -> List[OnPolicySample]:
+        """Add unique prompt_id and request_id to each sample"""
+        if not samples:
+            return samples
+
+        all_messages = gather_object([s.messages for s in samples])
+        messages_to_prompt_id = {}
+        prompt_id_counter = 0
+
+        for messages in all_messages:
+            key = json.dumps(messages)
+            if key not in messages_to_prompt_id:
+                messages_to_prompt_id[key] = f'prompt_{prompt_id_counter}'
+                prompt_id_counter += 1
+
+        for s in samples:
+            s.prompt_id = messages_to_prompt_id[json.dumps(s.messages)]
+            s.request_id = f'chatcmpl-{str(uuid.uuid4().hex)}'
+
+        return samples
+
+    def _server_rollout(self, samples: List[OnPolicySample], request_config: RequestConfig,
+                        is_global_inputs: bool) -> List[RolloutOutput]:
+        """Perform rollout inference using vLLM server mode"""
+        infer_requests = self.samples2requests(samples)
+
+        if is_global_inputs:
+            per_device_size = len(infer_requests) // self.accelerator.num_processes
+            all_requests = infer_requests
+            all_requests_lengths = [per_device_size] + [0] * (self.accelerator.num_processes - 1)
+        else:
+            all_requests = gather_object(infer_requests)
+            all_requests_lengths = gather_object([len(infer_requests)])
+
+        if not any(requests for requests in all_requests):
+            return []
+
+        if self.accelerator.is_main_process:
+            all_outputs: List[RolloutOutput] = self._engine_infer(
+                infer_requests=all_requests, request_config=request_config)
+            if len(all_outputs) != len(all_requests):
+                all_outputs = self._sort_by_request_id(all_outputs)
+        else:
+            all_outputs = [None] * len(all_requests)
+
+        if self.enable_server_multi_turn:
+            self.dynamic_num_samples = False
+            outputs_count = [len(all_outputs)] if self.accelerator.is_main_process else [0]
+            outputs_count = gather_object(outputs_count)[0]
+            if outputs_count != len(all_requests):
+                self.dynamic_num_samples = True
+                logger.warning(
+                    'Detected a multi-turn scheduler that splits one trajectory into multiple training samples '
+                    'This code path is scheduled for removal in future swift — please migrate '
+                    'to a single-trajectory scheduler (e.g. return one sample per request from `run`).')
+                if self.dynamic_sample:
+                    logger.warning('Mismatch between returned samples and requests detected.')
+                if self.template.padding_free:
+                    raise NotImplementedError('Padding free mode is not supported for dynamic sample')
+            if not self.accelerator.is_main_process:
+                all_outputs = [None] * outputs_count
+
+        if not is_global_inputs:
+            all_outputs = broadcast_object_list(all_outputs, from_process=0)
+
+            if not self.enable_server_multi_turn or not self.dynamic_num_samples:
+                start_idx = sum(all_requests_lengths[:self.accelerator.process_index])
+                end_idx = start_idx + all_requests_lengths[self.accelerator.process_index]
+                process_slice = slice(start_idx, end_idx)
+                outputs = all_outputs[process_slice]
+            else:
+                outputs = get_even_process_data(self, all_outputs)
+        else:
+            outputs = all_outputs if self.accelerator.is_main_process else []
+
+        return outputs
+
+    def _colocate_rollout(self, samples: List[OnPolicySample], request_config: RequestConfig) -> List[RolloutOutput]:
+        """Perform co-located rollout inference with TransformersEngine or vLLMEngine"""
+        # Convert samples to RolloutInferRequest at the engine boundary.
+        # Use samples2requests so include_extra (multi_turn_scheduler / vllm_server_pass_dataset)
+        # is honored consistently with the server path.
+        requests = self.samples2requests(samples)
+        if self.vllm_tensor_parallel_size > 1:
+            local_rank_in_group = torch.distributed.get_rank(group=self.tp_group)
+            local_input_length = len(samples)
+            all_input_lengths = [None] * self.vllm_tensor_parallel_size
+            torch.distributed.all_gather_object(all_input_lengths, local_input_length, group=self.tp_group)
+
+            start_idx = sum(all_input_lengths[:local_rank_in_group])
+            end_idx = start_idx + all_input_lengths[local_rank_in_group]
+
+            gathered_inputs = [None for _ in range(self.vllm_tensor_parallel_size)]
+            torch.distributed.all_gather_object(gathered_inputs, requests, group=self.tp_group)
+            requests = [p for sublist in gathered_inputs for p in sublist]
+
+        outputs: List[RolloutOutput] = self._engine_infer(infer_requests=requests, request_config=request_config)
+
+        if self.vllm_tensor_parallel_size > 1:
+            outputs = outputs[start_idx:end_idx]
+
+        return outputs
+
+    def _engine_infer(
+        self,
+        infer_requests: List[RolloutInferRequest],
+        request_config: Optional[RequestConfig] = None,
+        *,
+        use_tqdm: Optional[bool] = False,
+    ) -> List[RolloutOutput]:
+        """Perform inference using configured engine"""
+        with profiling_context(self, 'generate'), self._disable_sp_context():
+            if self.vllm_mode == 'server':
+                res = self.vllm_client.infer([asdict(req) for req in infer_requests],
+                                             asdict(request_config),
+                                             use_tqdm=use_tqdm)
+            else:
+                res = self.engine.infer(infer_requests, request_config, use_tqdm=use_tqdm)
+            if all(isinstance(r, RolloutOutput) for r in res):
+                return res
+            else:
+                assert all(isinstance(r, ChatCompletionResponse) for r in res)
+                return [RolloutOutput(response=r) for r in res]
+
+    @staticmethod
+    def _extract_logprobs_from_choice(response_choice) -> List[float]:
+        """Extract logprobs list from response choice for rollout importance sampling.
+
+        Args:
+            response_choice: The response choice containing logprobs
+
+        Returns:
+            List of logprob values, or empty list if not available
+        """
+        if response_choice.logprobs is None:
+            return []
+        if 'content' in response_choice.logprobs:
+            return [item['logprob'] for item in response_choice.logprobs['content']]
+        return []
+
+    def _postprocess_rollout_outputs(self, samples: List[OnPolicySample],
+                                     outputs: List[RolloutOutput]) -> List[OnPolicySample]:
+        """Merge rollout outputs back onto samples (per-sample mutation in apply_rollout_output).
+
+        Two paths:
+        - default: outputs are 1:1 aligned with local samples (single-turn colocate, server
+          single-trajectory). Use cheap zip — no cross-rank gather.
+        - dynamic_num_samples: a scheduler may split one trajectory into multiple training
+          samples, so outputs.id must be looked up against the global samples by request_id.
+        """
+        if not self.dynamic_num_samples:
+            if self.async_generate and not outputs:
+                return outputs
+            assert len(samples) == len(outputs), (f'samples ({len(samples)}) and outputs ({len(outputs)}) mismatch')
+            results = []
+            for sample, output in zip(samples, outputs):
+                sample = deepcopy(sample)
+                sample.apply_rollout_output(rollout_output=output)
+                results.append(sample)
+            return results
+
+        global_samples = gather_object(samples)
+        id2sample = {}
+        for sample in global_samples:
+            if sample.request_id not in id2sample:
+                id2sample[sample.request_id] = sample
+        results = []
+        for output in outputs:
+            request_id = output.response.id
+            assert request_id in id2sample, f'Request ID {request_id} not found in inputs'
+            sample = deepcopy(id2sample[request_id])
+            sample.apply_rollout_output(rollout_output=output)
+            results.append(sample)
+        return results
+
+    @torch.no_grad()
+    def offload_model(self, model):
+        # FSDP2: simple .cpu() is sufficient
+        if self._is_fsdp2:
+            model.cpu()
+            torch.cuda.empty_cache()
+            return
+
+        # Default: iterate over parameters
+        for param in model.parameters():
+            # After DeepSpeed distributed loading: param.data is empty and weights cannot be off-loaded.
+            # The real weights are stored in ds_tensor.
+            if is_deepspeed_enabled() and hasattr(param, 'ds_tensor'):
+                param.ds_tensor.data = param.ds_tensor.data.to('cpu', non_blocking=True)
+            else:
+                param.data = param.data.to(torch.device('cpu'), non_blocking=True)
+        torch.cuda.empty_cache()
+
+    @torch.no_grad()
+    def load_model(self, model):
+        device = get_current_device()
+
+        # FSDP2: simple .to(device) is sufficient
+        if self._is_fsdp2:
+            model.to(device)
+            return
+
+        # Default: iterate over parameters
+        for param in model.parameters():
+            # Reverse logic of off-loading: move weights back to target device
+            if is_deepspeed_enabled() and hasattr(param, 'ds_tensor'):
+                param.ds_tensor.data = param.ds_tensor.data.to(device, non_blocking=True)
+            else:
+                param.data = param.data.to(device, non_blocking=True)
+
+    @torch.no_grad()
+    def offload_optimizer(self):
+        if not self.optimizer.state:
+            return
+
+        if is_deepspeed_enabled():
+            # DeepSpeed optimizer: param_groups may be empty
+            for _, state in self.optimizer.state.items():
+                # Iterate over a copy to avoid dict size change errors
+                for key, value in list(state.items()):
+                    if not isinstance(value, torch.Tensor):
+                        continue
+                    # Skip if already on CPU
+                    if value.device.type == 'cpu':
+                        continue
+
+                    offload_key = f'{key}_offload_buffer'
+                    if offload_key not in state:
+                        state[offload_key] = torch.empty_like(value, device='cpu')
+
+                    state[offload_key].copy_(value, non_blocking=True)
+                    value.data = state[offload_key]
+            return
+
+        # Original non-DeepSpeed logic
+        for param_group in self.optimizer.param_groups:
+            if not param_group.get('params'):
+                logger.warning("Empty param_group['params'] detected in non-DeepSpeed optimizer.")
+                continue
+
+            for param in param_group['params']:
+                state = self.optimizer.state.get(param)
+                if not state:
+                    continue
+                for key, value in list(state.items()):  # Iterate over a list copy
+                    if isinstance(value, torch.Tensor) and value.device.type != 'cpu':
+                        state[key] = value.to('cpu', non_blocking=True)
+
+    @torch.no_grad()
+    def load_optimizer(self):
+        if not self.optimizer.state:
+            return
+
+        device = get_current_device()
+
+        if is_deepspeed_enabled():
+            for _, state in self.optimizer.state.items():
+                for key, value in list(state.items()):
+                    if not isinstance(value, torch.Tensor):
+                        continue
+
+                    offload_key = f'{key}_offload_buffer'
+                    if offload_key in state:
+                        value.data = state[offload_key].to(device, non_blocking=True)
+            return
+
+        # Original non-DeepSpeed logic
+        for param_group in self.optimizer.param_groups:
+            if not param_group.get('params'):
+                logger.warning("Empty param_group['params'] detected in non-DeepSpeed optimizer.")
+                continue
+
+            for param in param_group['params']:
+                state = self.optimizer.state.get(param)
+                if not state:
+                    continue
+                for key, value in list(state.items()):  # Iterate over a list copy
+                    if isinstance(value, torch.Tensor) and value.device.type == 'cpu':
+                        state[key] = value.to(device, non_blocking=True)
+
+    @contextmanager
+    def offload_context(self):
+        """
+        Context manager for model/optimizer offloading.
+
+        This is a placeholder implementation. Subclasses (like GRPOTrainer)
+        should override this method to provide actual offload/reload logic.
+        """
+        yield
+
+    def _prepare_scheduler(self):
+        """Prepare multi-turn scheduler"""
+        args = self.args
+
+        self.multi_turn_scheduler = None
+        if not hasattr(args, 'multi_turn_scheduler'):
+            return
+
+        if args.multi_turn_scheduler:
+            # Get tokenizer for scheduler (needed in colocate mode where infer_engine may be None)
+            tokenizer = getattr(self, 'processing_class', None)
+            if isinstance(args.multi_turn_scheduler, str):
+                assert args.multi_turn_scheduler in multi_turns
+                scheduler_kwargs = {'max_turns': args.max_turns, 'tokenizer': tokenizer}
+                gym_env = getattr(args, 'gym_env', None)
+                if gym_env is not None:
+                    scheduler_kwargs['gym_env'] = gym_env
+                multi_turn_scheduler = multi_turns[args.multi_turn_scheduler](**scheduler_kwargs)
+                self.multi_turn_scheduler: MultiTurnScheduler = multi_turn_scheduler
+            else:
+                assert isinstance(args.multi_turn_scheduler, MultiTurnScheduler)
+                self.multi_turn_scheduler: MultiTurnScheduler = args.multi_turn_scheduler
+
+    @contextmanager
+    def multi_turn_completion_length_context(self):
+        """Context manager for multi-turn completion length limiting"""
+        if not (self.multi_turn_scheduler and
+                self.use_fast_infer) or self.vllm_mode == 'server' or self.completion_length_limit_scope == 'per_round':
+            yield
+            return
+
+        original_fn = self.engine.set_default_max_tokens
+        original_max_len = self.engine.max_model_len
+
+        def set_default_max_tokens(_self, request_config: RequestConfig, inputs: Dict[str, Any]) -> None:
+            original_max_len = _self.max_model_len or 8192
+            assert isinstance(inputs, dict)
+            prompt_tokens = _self._get_num_tokens(inputs)
+
+            if not hasattr(_self, 'set_grpo_max_model_len'):
+                max_len = min(original_max_len, prompt_tokens + request_config.max_tokens)
+                _self.max_model_len = max_len
+                _self.set_grpo_max_model_len = True
+            else:
+                if _self.max_model_len <= prompt_tokens:
+                    num_tokens_avoid_crash = 10
+                    _self.max_model_len = (prompt_tokens + num_tokens_avoid_crash)
+                    request_config.max_tokens = num_tokens_avoid_crash
+
+            original_fn(request_config, inputs)
+
+        try:
+            self.engine.set_default_max_tokens = MethodType(set_default_max_tokens, self.engine)
+            yield
+        finally:
+            self.engine.set_default_max_tokens = original_fn
+            self.engine.max_model_len = original_max_len
+            del self.engine.set_grpo_max_model_len
+
+    def samples2requests(self, samples: Union[List[OnPolicySample],
+                                              List[RolloutInferRequest]]) -> List[RolloutInferRequest]:
+        """Convert OnPolicySamples into RolloutInferRequest objects.
+
+        The per-sample mapping lives in ``OnPolicySample.to_infer_request``.
+        Dataset passthrough columns (``extra``) are forwarded via ``data_dict``
+        when running server mode with ``vllm_server_pass_dataset`` or under a
+        multi-turn scheduler.
+        """
+        if not samples:
+            return []
+
+        include_extra = bool(getattr(self.args, 'vllm_server_pass_dataset', False)) or bool(self.multi_turn_scheduler)
+        requests_list = []
+        for data in samples:
+            if isinstance(data, RolloutInferRequest):
+                requests_list.append(data)
+            else:
+                requests_list.append(data.to_infer_request(include_extra=include_extra))
+        return requests_list
+
+    def async_generate_rollout(self, all_inputs: List[OnPolicySample]):
+        """Async generation task for rollout"""
+        current_queue = self._queue
+
+        def infer_task():
+            try:
+                with self.multi_turn_completion_length_context():
+                    return self._infer_single_or_multi_turn(all_inputs, self.request_config, is_global_inputs=True)
+            except Exception as e:
+                logger.error('Inference task failed: %s', str(e))
+                raise
+
+        future: Future = self.executor.submit(infer_task)
+
+        def done(future):
+            try:
+                result = future.result()
+                current_queue.put(DataCache(result))
+            except Exception as e:
+                logger.error('Error in async_generate_rollout callback: %s', str(e))
+
+        future.add_done_callback(done)
+
+    def _prepare_async_generate(self):
+        """Initialize async generation queues and callback"""
+        self.train_queue = Queue()
+        self.eval_queue = Queue()
+        args = self.args
+
+        if args.async_generate:
+            self.add_callback(AsyncGenerateCallback(self))
+
+    @property
+    def _queue(self):
+        """Get the appropriate queue based on training/eval mode"""
+        if self.control.should_evaluate:
+            return self.eval_queue
+        else:
+            return self.train_queue
+
+    def _wait_queue(self):
+        """Wait for queue to have items"""
+        while self._queue.empty():
+            time.sleep(0.01)
+
+    def _sort_by_request_id(self, all_outputs: List[RolloutOutput]) -> List[RolloutOutput]:
+        """Sort rollout outputs by request_id to group outputs together"""
+        request_ids = [output.response.id for output in all_outputs]
+        output_pairs = list(zip(request_ids, all_outputs))
+        output_pairs.sort(key=lambda x: x[0])
+        sorted_outputs = [output for _, output in output_pairs]
+        return sorted_outputs
+
+    def _prefetch(self, dataloader: DataLoader):
+        inputs = next(iter(dataloader))
+        if self.template.truncation_strategy == 'raise':
+            inputs = self.resample_encode_failed_inputs(inputs)
+        inputs = self.to_samples(inputs)
+        inputs = self._preprocess_inputs(inputs)
+        all_inputs = gather_object(inputs)
+        if self.state.global_step != self._last_loaded_step:
+            self._move_model_to_vllm(skip_async_check=True)
+            self._last_loaded_step = self.state.global_step
+        results = self._infer_single_or_multi_turn(all_inputs, self.request_config, is_global_inputs=True)
+        self._queue.put(DataCache(results))
+
+    @contextmanager
+    def _disable_sp_context(self, template: Optional[Template] = None):
+        """
+        Context manager to temporarily disable Sequence Parallel (SP) for operations
+        like reward model inference that should not use SP.
+
+        All SP-patched functions in ulysses.py check `sequence_parallel.world_size == 1`
+        and automatically bypass SP logic when this condition is true. This makes the
+        disable mechanism simple and robust - we only need to set world_size = 1.
+        """
+
+        # Save original SP state
+        origin_size = sequence_parallel.world_size
+        origin_extra_kwargs = sequence_parallel.extra_kwargs.copy()
+
+        # Disable SP by setting world_size = 1
+        # All patched functions will check this and use original implementations
+        sequence_parallel.world_size = 1
+        sequence_parallel.extra_kwargs = {}
+
+        # Also update template settings if provided
+        original_padding_free = None
+        original_sequence_parallel_size = None
+        if template is not None:
+            original_padding_free = template.padding_free
+            template.padding_free = False
+            original_sequence_parallel_size = template.sequence_parallel_size
+            template.sequence_parallel_size = 1
+
+        try:
+            yield
+        finally:
+            # Restore SP state
+            sequence_parallel.world_size = origin_size
+            sequence_parallel.extra_kwargs = origin_extra_kwargs
+
+            if template is not None:
+                template.padding_free = original_padding_free
+                template.sequence_parallel_size = original_sequence_parallel_size
+
+    @contextmanager
+    def _template_context(self,
+                          template: Template,
+                          inputs: Optional['DataType'] = None,
+                          max_length: Optional[int] = None,
+                          mode: Optional[str] = None):
+        # used for unsetting max_length
+        original_max_length = template.max_length
+        original_mode = template.mode
+        template.max_length = max_length
+        if mode is not None:
+            template.set_mode(mode)
+        forward_ctx = template.forward_context(self.model, inputs) if inputs is not None else nullcontext()
+        try:
+            with forward_ctx:
+                yield
+        finally:
+            template.max_length = original_max_length
+            if mode is not None:
+                template.set_mode(original_mode)
+
+    def _prepare_resample_data_iterator(self):
+        """Initialize resample data iterator for truncation_strategy 'raise'('delete').
+
+        When truncation_strategy is 'raise'(delete), encoding may fail for some samples due to
+        exceeding max_length. This iterator provides backup samples for resampling.
+        """
+
+        def cyclic_iter(iterable):
+            while True:
+                for x in iterable:
+                    yield x
+
+        @contextmanager
+        def seed_context():
+            # Use a different seed to ensure the resample dataset does not overlap with train_dataset
+            seed = self.args.seed
+            self.args.seed = seed + 1
+            yield
+            self.args.seed = seed
+
+        with seed_context():
+            self.truncated_resample_iterator = cyclic_iter(self.get_train_dataloader())
+
+    @profiling_decorator
+    def resample_encode_failed_inputs(self,
+                                      inputs: DataType,
+                                      max_resample_rounds: int = 10,
+                                      strip_response=True) -> DataType:
+        """
+        Attempt to encode each input using the template. If encoding fails,
+        resample from a backup iterator until we have enough valid samples.
+
+        This method handles two cases:
+        1. Prompt length exceeds max_length
+        2. Encoding failures (e.g., multimodal data processing errors)
+
+        This implementation uses a pending_samples buffer to accumulate valid samples
+        from each resample batch, avoiding waste when per_device_train_batch_size > 1.
+
+        Args:
+            inputs (DataType): A list of input data samples, each containing a `messages` field.
+            max_resample_rounds (int, optional): Maximum number of resample rounds.
+                Each round processes samples from pending_samples buffer. Defaults to 10.
+            strip_response (bool, optional): Whether to remove the response from the input data. Defaults to True.
+
+        Returns:
+            DataType: A list of successfully encoded input samples with the same length as inputs.
+
+        Raises:
+            RuntimeError: If we cannot collect enough valid samples after max_resample_rounds.
+        """
+        assert getattr(self, 'truncated_resample_iterator',
+                       None) is not None, 'Resample data iterator is not initialized'
+
+        return resample_encode_failed_inputs(
+            self.template,
+            self.truncated_resample_iterator,
+            inputs,
+            max_resample_rounds=max_resample_rounds,
+            strip_response=strip_response,
+        )

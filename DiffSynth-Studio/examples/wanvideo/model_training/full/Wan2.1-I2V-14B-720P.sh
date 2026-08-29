@@ -1,0 +1,18 @@
+modelscope download --dataset DiffSynth-Studio/diffsynth_example_dataset --include "wanvideo/Wan2.1-I2V-14B-720P/*" --local_dir ./data/diffsynth_example_dataset
+
+accelerate launch --config_file examples/wanvideo/model_training/full/accelerate_config_14B.yaml examples/wanvideo/model_training/train.py \
+  --dataset_base_path data/diffsynth_example_dataset/wanvideo/Wan2.1-I2V-14B-720P \
+  --dataset_metadata_path data/diffsynth_example_dataset/wanvideo/Wan2.1-I2V-14B-720P/metadata.csv \
+  --height 720 \
+  --width 1280 \
+  --num_frames 49 \
+  --dataset_repeat 100 \
+  --model_id_with_origin_paths "Wan-AI/Wan2.1-I2V-14B-720P:diffusion_pytorch_model*.safetensors,Wan-AI/Wan2.1-I2V-14B-720P:models_t5_umt5-xxl-enc-bf16.pth,Wan-AI/Wan2.1-I2V-14B-720P:Wan2.1_VAE.pth,Wan-AI/Wan2.1-I2V-14B-720P:models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth" \
+  --learning_rate 1e-5 \
+  --num_epochs 2 \
+  --remove_prefix_in_ckpt "pipe.dit." \
+  --output_path "./models/train/Wan2.1-I2V-14B-720P_full" \
+  --trainable_models "dit" \
+  --extra_inputs "input_image" \
+  --use_gradient_checkpointing_offload \
+  --initialize_model_on_cpu

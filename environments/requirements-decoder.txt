@@ -1,0 +1,28 @@
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+# CUDA/PyTorch contract used for the released result.
+torch==2.6.0+cu124
+torchvision==0.21.0+cu124
+ninja==1.13.0
+
+# DiffSynth and PhiZero inference dependencies.
+accelerate==1.14.0
+av==17.1.0
+datasets==4.8.4
+einops==0.8.2
+ftfy==6.3.1
+huggingface-hub==1.19.0
+imageio==2.37.3
+imageio-ffmpeg==0.6.0
+kornia==0.8.3
+modelscope==1.37.1
+numpy==2.4.4
+pandas==2.3.3
+peft==0.19.1
+pillow==11.3.0
+protobuf==6.33.6
+safetensors==0.8.0
+sentencepiece==0.2.1
+tokenizers==0.22.2
+tqdm==4.67.3
+transformers==5.12.1

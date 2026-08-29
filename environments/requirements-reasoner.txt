@@ -1,0 +1,56 @@
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+# CUDA/PyTorch contract used for the released result.
+torch==2.6.0+cu124
+torchvision==0.21.0+cu124
+ninja==1.13.0
+
+# ms-swift inference and full-SFT dependencies. Direct dependencies are pinned
+# so a fresh install cannot silently select a newer, behavior-changing stack.
+accelerate==1.14.0
+addict==2.4.0
+aiohttp==3.14.1
+attrdict==2.0.1
+av==17.1.0
+binpacking==2.0.1
+charset-normalizer==3.4.7
+cpm-kernels==1.0.11
+dacite==1.9.2
+datasets==4.8.4
+deepspeed==0.18.9
+einops==0.8.2
+fastapi==0.137.1
+gradio==5.50.0
+huggingface-hub==1.19.0
+importlib-metadata==9.0.0
+json-repair==0.60.1
+matplotlib==3.11.0
+modelscope==1.37.1
+nltk==3.9.4
+numpy==2.4.4
+openai==2.41.1
+opencv-python-headless==4.13.0.92
+oss2==2.19.1
+pandas==2.3.3
+peft==0.19.1
+pillow==11.3.0
+protobuf==6.33.6
+psutil==7.2.2
+PyYAML==6.0.3
+qwen-vl-utils==0.0.14
+requests==2.34.2
+rouge==1.0.1
+safetensors==0.8.0
+scipy==1.17.1
+sentencepiece==0.2.1
+simplejson==4.1.1
+sortedcontainers==2.4.0
+tensorboard==2.20.0
+tiktoken==0.12.0
+tokenizers==0.22.2
+tqdm==4.67.3
+transformers==5.12.1
+transformers-stream-generator==0.0.5
+trl==0.29.1
+uvicorn==0.46.0
+zstandard==0.25.0

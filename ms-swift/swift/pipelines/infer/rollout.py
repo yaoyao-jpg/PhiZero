@@ -1,0 +1,1112 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
+# Code partially sourced from Hugging Face TRL
+
+# fmt: off
+# apply patch before importing trl, which may internally reference GuidedDecodingParams
+try:
+    import vllm
+    try:
+        from vllm.sampling_params import GuidedDecodingParams
+    except ImportError:
+        import vllm.sampling_params
+
+        # removed in https://github.com/vllm-project/vllm/pull/22772
+        vllm.sampling_params.GuidedDecodingParams = vllm.sampling_params.StructuredOutputsParams
+except ImportError:
+    pass
+# fmt: on
+import asyncio
+import inspect
+import multiprocessing
+import os
+import time
+import torch
+import torch.distributed.distributed_c10d as c10d
+import traceback
+import uvicorn
+from aiohttp import ClientConnectorError
+from collections.abc import Sequence
+from contextlib import asynccontextmanager, contextmanager
+from dataclasses import asdict
+from fastapi import FastAPI
+from itertools import chain
+from multiprocessing import Pipe, Process
+from multiprocessing.connection import Connection
+from transformers.utils import is_torch_npu_available
+from typing import Any, Dict, List, Optional, Union
+
+from swift.arguments import RolloutArguments
+from swift.infer_engine import GRPOVllmEngine, InferClient
+from swift.infer_engine.protocol import (InitCommunicatorRequest, RequestConfig, RolloutInferRequest,
+                                         UpdateWeightsRequest)
+from swift.rlhf_trainers.utils import (VLLM_LORA_INT_ID, VLLM_LORA_NAME, VLLM_LORA_PATH, FlattenedTensorBucket,
+                                       FlattenedTensorMetadata, TensorLoRARequest, UpdateAdapterRequest,
+                                       UpdateFlattenedAdapterRequest, UpdateFlattenedParamsRequest,
+                                       broadcast_tensor_for_vllm_weight_sync, check_vllm_version_ge, chunk_list,
+                                       finish_vllm_weight_reload, patch_vllm_load_adapter,
+                                       patch_vllm_moe_model_weight_loader, vllm_supports_lora_load_inplace)
+from swift.rollout import RolloutScheduler, multi_turns
+from swift.utils import (gc_collect, get_logger, get_physical_device_count, get_seed, ipc_collect, is_torch_rocm,
+                         is_vllm_ascend_available, is_vllm_metax_available, synchronize)
+from ..base import SwiftPipeline
+
+try:
+    if check_vllm_version_ge('0.11.1'):
+        from vllm.utils.network_utils import get_open_port
+    else:
+        from vllm.utils import get_open_port
+    from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+    from vllm.distributed.parallel_state import get_world_group
+    from vllm.distributed.utils import StatelessProcessGroup
+    if is_vllm_ascend_available():
+        from vllm_ascend.distributed.device_communicators.pyhccl import PyHcclCommunicator as PyNcclCommunicator  # noqa
+
+    if is_vllm_metax_available():
+        import vllm_metax.patch
+except ImportError:
+    pass
+"""
+This module defines the execution logic for `swift rollout`.
+It adds weight synchronization logic based on `vLLMEngine`.
+
+Usage:
+    swift rollout \
+        --model xxx \
+        --vllm_tensor_parallel_size xxx \
+        --vllm_data_parallel_size xxx \
+        --vllm_use_async_engine true/false \
+        --other_vllm_arguments
+
+Note:
+- Rollout is intended solely for GRPO training sampling.
+- For inference or deployment, please use the `swift infer` or `swift deploy` commands.
+"""
+
+patch_vllm_load_adapter()
+
+
+def _set_death_signal():
+    """Ensure this process is killed when its parent exits.
+
+    Prevents orphan vLLM TP worker processes from leaking GPU memory
+    when the parent Ray actor dies unexpectedly.
+    """
+    import ctypes
+    import platform
+    import signal
+    if platform.system() != 'Linux':
+        return
+    libc = ctypes.CDLL('libc.so.6')
+    libc.prctl(1, signal.SIGKILL)
+    if os.getppid() == 1:
+        os.kill(os.getpid(), signal.SIGKILL)
+
+
+def _patch_full_weight_reload_loader(model) -> None:
+    patch_vllm_moe_model_weight_loader(model, load_preprocessed_weight=is_vllm_ascend_available())
+
+
+class WeightSyncWorkerExtension:
+
+    # The following attributes are initialized when `init_communicator` method is called.
+    communicator = None  # Communicator for weight updates
+    client_rank = None  # Source rank for broadcasting updated weights
+
+    def __new__(cls, **kwargs):
+        _set_death_signal()
+        return super().__new__(cls)
+
+    def init_communicator(self, host: str, port: int, world_size: int) -> None:
+        """
+        Initializes the weight update communicator using a stateless process group.
+
+        This method creates a `StatelessProcessGroup` that allows external training processes to communicate with vLLM
+        workers without interfering with the global torch distributed group.
+
+        Args:
+            host (`str`):
+                Hostname or IP address of the master node.
+            port (`int`):
+                Port number to be used for communication.
+            world_size (`int`):
+                Total number of participating processes in the update group.
+        """
+        if self.communicator is not None:
+            return
+
+        parallel_config = getattr(getattr(self, 'vllm_config', None), 'parallel_config', None)
+        dp_index = int(getattr(parallel_config, 'data_parallel_index', 0)) if parallel_config is not None else 0
+        if dp_index > 0:
+            dp_rank = dp_index
+            tp_size = int(parallel_config.tensor_parallel_size)
+        else:
+            dp_rank = int(os.environ.get('SWIFT_ROLLOUT_DP_RANK', '0'))
+            tp_size = int(os.environ.get('SWIFT_ROLLOUT_TP_RANK', '1'))
+        rank = get_world_group().rank + dp_rank * tp_size
+
+        # Create a stateless process group to manage communication between training processes and vLLM workers.
+        # Initialize the NCCL-based communicator for weight synchronization.
+        pg = StatelessProcessGroup.create(host=host, port=port, rank=rank, world_size=world_size)
+
+        if is_vllm_ascend_available():
+            # https://github.com/modelscope/ms-swift/issues/5920
+            device = get_world_group().local_rank
+            import torch_npu
+            torch_npu.npu.set_device(device)
+        else:
+            device = self.device
+
+        self.communicator = PyNcclCommunicator(pg, device=device)
+
+        # The client process that sends updated weights has the highest rank (world_size - 1).
+        self.client_rank = world_size - 1
+
+    def get_state_keys(self) -> List[str]:
+        """Return runtime model parameter names for exact weight-name mapping."""
+        return list(dict(self.model_runner.model.named_parameters()).keys())
+
+    def update_named_param(self, name: str, dtype: str, shape: Sequence[int]) -> None:
+        """
+        Receives updated weights from the client process and updates the named parameter in the model.
+
+        Args:
+            name (`str`):
+                Name of the weight tensor being updated.
+            dtype (`str`):
+                Data type of the weight tensor as a string (e.g., `"torch.float32"`).
+            shape (`Sequence[int]`):
+                Shape of the weight tensor.
+        """
+        if self.communicator is None:
+            raise RuntimeError('Communicator not initialized. Call `init_communicator` first.')
+
+        dtype = getattr(torch, dtype.split('.')[-1])
+        # Allocate memory for the incoming weight tensor on the correct device.
+        weight = torch.empty(shape, dtype=dtype, device=self.communicator.device)
+
+        # Use NCCL to broadcast the updated weights from the client (src) to all workers.
+        broadcast_tensor_for_vllm_weight_sync(self.communicator, weight, src=self.client_rank)
+        synchronize()
+        self.communicator.group.barrier()
+
+        # Patch MoE weight_loader if needed. This endpoint updates base weights
+        # one by one, so use the same full-reload layout setup as flattened
+        # base-weight sync before the final post-load processing request.
+        _patch_full_weight_reload_loader(self.model_runner.model)
+
+        # Load the received weights into the model.
+        self.model_runner.model.load_weights(weights=[(name, weight)])
+
+    def update_adapter_flattened_param(self, peft_config: Dict, metadatas: list[Dict]) -> None:
+        """
+        Receives and applies a flattened LoRA adapter to the model.
+        """
+        metadatas = [FlattenedTensorMetadata(**metadata) for metadata in metadatas]
+        if self.communicator is None:
+            raise RuntimeError('Communicator not initialized. Call `init_communicator` first.')
+
+        total_bytes = metadatas[-1].end_idx
+        flatten_tensor = torch.empty(total_bytes, dtype=torch.uint8, device=self.communicator.device)
+        broadcast_tensor_for_vllm_weight_sync(self.communicator, flatten_tensor, src=self.client_rank)
+        synchronize()
+        self.communicator.group.barrier()
+
+        named_params = FlattenedTensorBucket(metadata=metadatas, flattened_tensor=flatten_tensor).reconstruct_tensors()
+        req_kw = dict(
+            lora_name=VLLM_LORA_NAME,
+            lora_int_id=VLLM_LORA_INT_ID,
+            lora_path=VLLM_LORA_PATH,
+            peft_config=peft_config,
+            lora_tensors=named_params,
+        )
+        if vllm_supports_lora_load_inplace():
+            req_kw['load_inplace'] = True
+        else:
+            self.remove_lora(VLLM_LORA_INT_ID)
+        lora_request = TensorLoRARequest(**req_kw)
+        self.add_lora(lora_request)
+
+    def update_adapter_param(self, peft_config: Dict, lora_tensors_metadata: list[Dict]) -> None:
+        """
+        Receives and applies a LoRA adapter to the model without flattening.
+        Each tensor is broadcast individually.
+
+        Args:
+            peft_config: PEFT configuration dictionary.
+            lora_tensors_metadata: List of metadata dictionaries for each tensor.
+        """
+        if self.communicator is None:
+            raise RuntimeError('Communicator not initialized. Call `init_communicator` first.')
+
+        # Receive each tensor individually
+        named_params = {}
+        for metadata in lora_tensors_metadata:
+            name = metadata['name']
+            dtype = getattr(torch, metadata['dtype'].split('.')[-1])
+            shape = tuple(metadata['shape'])
+            tensor = torch.empty(shape, dtype=dtype, device=self.communicator.device)
+            broadcast_tensor_for_vllm_weight_sync(self.communicator, tensor, src=self.client_rank)
+            named_params[name] = tensor
+
+        synchronize()
+        self.communicator.group.barrier()
+
+        req_kw = dict(
+            lora_name=VLLM_LORA_NAME,
+            lora_int_id=VLLM_LORA_INT_ID,
+            lora_path=VLLM_LORA_PATH,
+            peft_config=peft_config,
+            lora_tensors=named_params,
+        )
+        if vllm_supports_lora_load_inplace():
+            req_kw['load_inplace'] = True
+        else:
+            self.remove_lora(VLLM_LORA_INT_ID)
+        lora_request = TensorLoRARequest(**req_kw)
+        self.add_lora(lora_request)
+
+    def update_flattened_params(self, metadatas: list[Dict]) -> None:
+        """
+        Receives updated flattened weights from the client process and updates the model parameters.
+
+        Args:
+            metadatas (list[Dict]): List of metadata dictionaries for the flattened tensors.
+        """
+        metadatas = [FlattenedTensorMetadata(**metadata) for metadata in metadatas]
+        if self.communicator is None:
+            raise RuntimeError('Communicator not initialized. Call `init_communicator` first.')
+
+        total_bytes = metadatas[-1].end_idx
+        flatten_tensor = torch.empty(total_bytes, dtype=torch.uint8, device=self.communicator.device)
+
+        broadcast_tensor_for_vllm_weight_sync(self.communicator, flatten_tensor, src=self.client_rank)
+        synchronize()
+        self.communicator.group.barrier()
+
+        named_params = FlattenedTensorBucket(metadata=metadatas, flattened_tensor=flatten_tensor).reconstruct_tensors()
+
+        _patch_full_weight_reload_loader(self.model_runner.model)
+        self.model_runner.model.load_weights(weights=list(named_params.items()))
+
+    def process_weights_after_loading(self) -> None:
+        """Re-run process_weights_after_loading once after ALL weight
+        buckets have been loaded, so the kernel-format layout is rebuilt
+        on complete weights rather than partial ones.
+
+        Uses vLLM's built-in ``process_weights_after_loading`` when
+        *model_config* and *target_device* are available (same as verl);
+        falls back to FusedMoE-only path otherwise.
+        """
+        model_config = self.model_runner.model_config
+        finish_vllm_weight_reload(self.model_runner.model, model_config=model_config, target_device=self.device)
+
+    def close_communicator(self) -> None:
+        """
+        Closes the communicator when weight synchronization is no longer needed.
+
+        This method deletes the NCCL communicator to release associated resources.
+        """
+
+        if self.communicator is not None:
+            del self.communicator
+            self.communicator = None  # Ensure attribute is reset to None
+            self.client_rank = None  # Ensure attribute is reset to None
+
+    # ------------------------------------------------------------------
+    # ZMQ + CUDA-IPC / shared-memory bucketed weight sync
+    # ------------------------------------------------------------------
+    #
+    # Counterpart of ``VllmServer.update_weights_ipc`` (see
+    # ``swift/ray/megatron/rollout/vllm_server.py``).  Avoids the extra
+    # NCCL broadcast hop of ``update_flattened_params`` and reuses the
+    # sender's bucket buffer via CUDA IPC (same node, same device) or
+    # shared memory (CPU / cross-device fallback).
+    #
+    # TP>1:
+    #   Only the TP driver (rank 0 in the TP group) talks to the ZMQ
+    #   socket; the IPC handle / shm name and every bucket metadata is
+    #   broadcast via vLLM's TP cpu_group so all ranks can rebuild the
+    #   same buffer and load their own TP shard.
+    #
+    # LoRA / chunked tensors / FP8-QAT re-packing:
+    #   Intentionally NOT implemented here.  GRPO / GKD in swift Ray
+    #   uses full-parameter sync; LoRA / QAT paths keep going through
+    #   ``update_flattened_params`` + ``init_communicator``.
+
+    @staticmethod
+    def _ipc_handle_signature(handle) -> tuple | None:
+        """Derive a stable signature for a CUDA IPC handle.
+
+        Two handles map the same CUDA memory region when their inner
+        storage-handle bytes and metadata match.  We hash only the
+        picklable / comparable parts to detect reuse.
+        """
+        try:
+            _, args = handle
+        except Exception:
+            return None
+        sig = []
+        for v in args:
+            if isinstance(v, (bytes, bytearray)):
+                sig.append(('bytes', bytes(v)))
+            elif isinstance(v, (int, float, bool, str)) or v is None:
+                sig.append(('scalar', v))
+            else:
+                try:
+                    sig.append(('repr', repr(v)))
+                except Exception:
+                    return None
+        return tuple(sig)
+
+    def update_weights_from_ipc(
+        self,
+        use_shm: bool = False,
+        zmq_handle: Optional[str] = None,
+        timeout_s: int = 300,
+        peft_config: Optional[Dict] = None,
+        base_sync_done: bool = False,
+    ) -> None:
+        """Receive and load weights via ZMQ + CUDA-IPC / SHM.
+
+        Called via ``collective_rpc('update_weights_from_ipc', kwargs=...)``
+        from ``VllmServer.update_weights_ipc``.  The sender binds a ZMQ
+        REQ socket on ``zmq_handle`` and sends
+          1. a CUDA IPC reduce_tensor handle (or ``{name, size}`` for shm),
+          2. per-bucket ``{bucket_meta, is_last}`` payloads,
+        with a sync ``recv()`` on our side so the sender can safely reuse
+        the shared buffer between buckets.
+
+        IPC buffer reuse: when the sender reuses the same CUDA IPC handle
+        across sync rounds (same ``BucketedWeightSender`` buffer), we skip
+        ``rebuild_cuda_tensor`` and reuse the cached mapping.  This avoids
+        accumulating IPC mappings that the CUDA driver releases lazily,
+        which is the root cause of apparent GPU memory growth under
+        frequent syncs.
+
+        When ``peft_config`` is provided and ``base_sync_done`` is True,
+        the received weights are loaded as a LoRA adapter via
+        ``TensorLoRARequest`` instead of ``model.load_weights``.
+        """
+        if zmq_handle is None:
+            raise ValueError('update_weights_from_ipc: zmq_handle is required')
+
+        import gc as _gc
+        import torch as _torch
+        import torch.distributed as _dist
+        import zmq
+        from torch.multiprocessing.reductions import rebuild_cuda_tensor
+
+        device = getattr(self, 'device', None)
+        if device is None:
+            local_rank = getattr(self, 'local_rank', 0)
+            device = _torch.device(f'cuda:{local_rank}' if _torch.cuda.is_available() else 'cpu')
+            self.device = device
+
+        tp_rank = getattr(self, 'rank', 0)
+        tp_size = 1
+        try:
+            tp_size = self.model_runner.parallel_config.tensor_parallel_size
+        except Exception:  # noqa: BLE001
+            pass
+        is_driver = (tp_rank == 0)
+
+        cpu_group = None
+        broadcast_src = 0
+        if tp_size > 1:
+            from vllm.distributed import get_tp_group
+            tp_coord = get_tp_group()
+            cpu_group = tp_coord.cpu_group
+            broadcast_src = tp_coord.ranks[0]
+
+        def _broadcast_obj(obj):
+            if cpu_group is None:
+                return obj
+            obj_list = [obj]
+            _dist.broadcast_object_list(obj_list, src=broadcast_src, group=cpu_group)
+            return obj_list[0]
+
+        socket = None
+        if is_driver:
+            ctx = zmq.Context.instance()
+            socket = ctx.socket(zmq.REP)
+            socket.setsockopt(zmq.RCVTIMEO, timeout_s * 1000)
+            socket.setsockopt(zmq.SNDTIMEO, timeout_s * 1000)
+            socket.setsockopt(zmq.LINGER, 0)
+            socket.connect(zmq_handle)
+
+        # ── Step 1: receive + rebuild IPC handle (with reuse) ────────
+        comm_metadata = socket.recv_pyobj() if is_driver else None
+        comm_metadata = _broadcast_obj(comm_metadata)
+
+        buffer = None
+        shm = None
+        if not use_shm:
+            handle = comm_metadata
+            handle_sig = self._ipc_handle_signature(handle)
+            cached_buf = getattr(self, '_swift_ipc_buffer', None)
+            cached_sig = getattr(self, '_swift_ipc_handle_signature', None)
+
+            if cached_buf is not None and cached_sig == handle_sig:
+                buffer = cached_buf
+            else:
+                if cached_buf is not None:
+                    self._swift_ipc_buffer = None
+                    self._swift_ipc_handle_signature = None
+                    del cached_buf
+                    _gc.collect()
+                    ipc_collect()
+
+                func, args = handle
+                list_args = list(args)
+                dev_idx = device.index if device.type == 'cuda' else 0
+                list_args[6] = dev_idx
+                buffer = func(*list_args) if callable(func) else rebuild_cuda_tensor(*list_args)
+                assert buffer.dtype == _torch.uint8
+                self._swift_ipc_buffer = buffer
+                self._swift_ipc_handle_signature = handle_sig
+        else:
+            from multiprocessing import shared_memory
+            shm = shared_memory.SharedMemory(name=comm_metadata['name'])
+            buffer = _torch.frombuffer(shm.buf[:comm_metadata['size']], dtype=_torch.uint8)
+
+        if is_driver:
+            socket.send(b'')  # ready for buckets
+
+        # ── Step 2: stream buckets and load_weights per bucket ──────
+        is_lora_sync = (peft_config is not None and base_sync_done)
+        all_lora_weights: Dict[str, Any] = {} if is_lora_sync else None
+
+        if not is_lora_sync:
+            _patch_full_weight_reload_loader(self.model_runner.model)
+
+        while True:
+            metadata = socket.recv_pyobj() if is_driver else None
+            metadata = _broadcast_obj(metadata)
+
+            bucket_meta = metadata['bucket_meta']
+            entries = list(bucket_meta.values()) if isinstance(bucket_meta, dict) else list(bucket_meta)
+
+            weights: List[tuple] = []
+            for meta in entries:
+                name = meta['name']
+                dtype = meta['dtype']
+                shape = meta['shape']
+                shape = shape if isinstance(shape, _torch.Size) else _torch.Size(shape)
+                offset = int(meta['offset'])
+                size = int(dtype.itemsize * shape.numel())
+
+                raw = buffer[offset:offset + size]
+                tensor = raw.view(dtype=dtype).view(shape)
+                if use_shm:
+                    tensor = tensor.to(device)
+                else:
+                    tensor = tensor.clone()
+                weights.append((name, tensor))
+
+            if _torch.cuda.is_available():
+                _torch.cuda.synchronize()
+
+            if is_driver:
+                socket.send(b'')  # bucket received
+
+            if tp_size > 1:
+                _dist.barrier(group=cpu_group)
+
+            if is_lora_sync:
+                for name, tensor in weights:
+                    all_lora_weights[name] = tensor
+            else:
+                self.model_runner.model.load_weights(weights=weights)
+            del weights
+            if metadata.get('is_last'):
+                break
+
+        # Re-run process_weights_after_loading so the kernel-format
+        # layout is rebuilt after the in-place reload (vLLM issue
+        # #42821).  Skipped for LoRA sync because the adapter path
+        # doesn't call ``load_weights``.
+        if not is_lora_sync:
+            model_config = self.model_runner.model_config
+            finish_vllm_weight_reload(self.model_runner.model, model_config=model_config, target_device=self.device)
+
+        if is_lora_sync and all_lora_weights:
+            req_kw = dict(
+                lora_name=VLLM_LORA_NAME,
+                lora_int_id=VLLM_LORA_INT_ID,
+                lora_path=VLLM_LORA_PATH,
+                peft_config=peft_config,
+                lora_tensors=all_lora_weights,
+            )
+            if vllm_supports_lora_load_inplace():
+                req_kw['load_inplace'] = True
+            else:
+                self.remove_lora(VLLM_LORA_INT_ID)
+            lora_request = TensorLoRARequest(**req_kw)
+            self.add_lora(lora_request)
+            del all_lora_weights
+
+        if is_driver and socket is not None:
+            socket.close()
+        del buffer
+        if shm is not None:
+            try:
+                shm.close()
+            except BufferError:
+                pass
+            shm = None
+        _gc.collect()
+        ipc_collect()
+        if _torch.cuda.is_available():
+            _torch.cuda.empty_cache()
+
+
+logger = get_logger()
+
+
+def safe_set_start_method():
+    if multiprocessing.get_start_method(allow_none=True) is None:
+        multiprocessing.set_start_method('spawn')
+
+
+def get_rollout_engine_type(args: RolloutArguments, engine: GRPOVllmEngine):
+    if args.multi_turn_scheduler:
+        if args.multi_turn_scheduler not in multi_turns:
+            raise ValueError(f"Multi-turn scheduler '{args.multi_turn_scheduler}' not found in multi_turns.")
+        scheduler_cls = multi_turns[args.multi_turn_scheduler]
+
+        kwargs = {}
+        if 'tokenizer' in list(inspect.signature(scheduler_cls.__init__).parameters):
+            kwargs['tokenizer'] = engine.template.tokenizer
+        # gym kwargs
+        if args.use_gym_env:
+            kwargs.update({
+                'use_gym_env': args.use_gym_env,
+                'gym_env': args.gym_env,
+            })
+
+        rollout_engine: RolloutScheduler = scheduler_cls(infer_engine=engine, max_turns=args.max_turns, **kwargs)
+        if not rollout_engine:
+            raise ValueError(f"Failed to initialize multi-turn scheduler '{args.multi_turn_scheduler}'.")
+    else:
+        rollout_engine = engine
+    return rollout_engine
+
+
+def _set_visible_devices_for_dp_rank(data_parallel_rank: int, tensor_parallel_size: int):
+
+    def _get_device_env_var():
+        if is_torch_npu_available():
+            return 'ASCEND_RT_VISIBLE_DEVICES'
+        return 'CUDA_VISIBLE_DEVICES'
+
+    env_var = _get_device_env_var()
+    current = os.environ.get(env_var)
+    if current:
+        all_devices = current.split(',')
+    else:
+        from swift.utils import get_device_count
+        all_devices = [str(i) for i in range(get_device_count())]
+
+    start = data_parallel_rank * tensor_parallel_size
+    end = start + tensor_parallel_size
+    selected = all_devices[start:end]
+
+    # ROCm: do NOT shrink the visibility mask to ``selected``. Restricting
+    # CUDA_VISIBLE_DEVICES (e.g. to "6,7") makes vLLM renumber those GPUs locally
+    # as cuda:0,1, so the device ids the rollout uses/reports diverge from the
+    # trainer's global numbering, and the cross-process RCCL weight-sync fails on
+    # ROCm with "invalid device ordinal" (the trainer can't resolve the rollout's
+    # GPUs). Instead keep EVERY physical GPU visible and only reorder the mask so
+    # the selected devices come first: vLLM still lands on the intended physical
+    # GPUs (cuda:0..tp-1 -> selected), while RCCL can resolve all peers (incl. the
+    # trainer's GPUs) by PCI bus id, so train<->rollout communication works.
+    if env_var == 'CUDA_VISIBLE_DEVICES' and is_torch_rocm():
+        total = get_physical_device_count()
+        sel_ints = []
+        for x in selected:
+            try:
+                sel_ints.append(int(x))
+            except ValueError:
+                sel_ints = []
+                break
+        if sel_ints and all(0 <= i < total for i in sel_ints):
+            rest = [i for i in range(total) if i not in sel_ints]
+            reordered = ','.join(str(i) for i in (sel_ints + rest))
+            os.environ['CUDA_VISIBLE_DEVICES'] = reordered
+            os.environ['HIP_VISIBLE_DEVICES'] = reordered
+            return
+
+    os.environ[env_var] = ','.join(selected)
+
+
+def llm_worker(args: RolloutArguments, data_parallel_rank: int, master_port: int, connection: Connection) -> None:
+    try:
+        args._import_external_plugins()
+        _set_visible_devices_for_dp_rank(data_parallel_rank, args.vllm_tensor_parallel_size)
+        os.environ['VLLM_DP_MASTER_PORT'] = str(master_port)
+        os.environ['SWIFT_ROLLOUT_DP_RANK'] = str(data_parallel_rank)
+        os.environ['SWIFT_ROLLOUT_TP_RANK'] = str(args.vllm_tensor_parallel_size)
+        worker_seed = get_seed()
+        engine = SwiftRolloutDeploy.get_infer_engine(args, template=args.get_template(), seed=worker_seed)
+        rollout_engine = get_rollout_engine_type(args, engine)
+    except Exception:
+        connection.send({'status': 'error', 'error': traceback.format_exc()})
+        return
+    connection.send({'status': 'ready'})
+
+    while True:
+        # Wait for commands from the parent process
+        try:
+            command = connection.recv()
+        except KeyboardInterrupt:
+            engine.engine.collective_rpc(method='close_communicator')
+            break
+
+        # Handle commands
+        if command['type'] in ['call', 'fire_and_forget']:
+            method_name = command['method']
+            args, kwargs = command.get('args', ()), command.get('kwargs', {})
+            method = getattr(rollout_engine, method_name, None) or getattr(rollout_engine.engine, method_name, None)
+            try:
+                result = method(*args, **kwargs)
+            except Exception:
+                logger.error(f'Method execution failed: {method_name}\n{traceback.format_exc()}')
+                result = None
+            if command['type'] == 'call':
+                connection.send(result)
+        elif command['type'] == 'shutdown':
+            break
+
+
+async def async_llm_worker(args: RolloutArguments, data_parallel_rank: int, master_port: int,
+                           connection: Connection) -> None:
+    try:
+        args._import_external_plugins()
+        os.environ['SWIFT_ROLLOUT_DP_RANK'] = str(data_parallel_rank)
+        os.environ['SWIFT_ROLLOUT_TP_RANK'] = str(args.vllm_tensor_parallel_size)
+        worker_seed = get_seed()
+        engine = SwiftRolloutDeploy.get_infer_engine(args, template=args.get_template(), seed=worker_seed)
+        rollout_engine = get_rollout_engine_type(args, engine)
+    except Exception:
+        connection.send({'status': 'error', 'error': traceback.format_exc()})
+        return
+    connection.send({'status': 'ready'})
+
+    loop = asyncio.get_running_loop()
+    while True:
+        try:
+            command = await loop.run_in_executor(None, connection.recv)
+        except KeyboardInterrupt:
+            await engine.engine.collective_rpc(method='close_communicator')
+            break
+
+        # Handle commands
+        if command['type'] in ['call', 'fire_and_forget']:
+            method_name = command['method']
+            args, kwargs = command.get('args', ()), command.get('kwargs', {})
+            method = getattr(rollout_engine, method_name, None) or getattr(rollout_engine.engine, method_name, None)
+            try:
+                result = await method(*args, **kwargs)
+            except Exception:
+                logger.error(f'Method execution failed: {method_name}\n{traceback.format_exc()}')
+                result = None
+
+            if command['type'] == 'call':
+                connection.send(result)
+        elif command['type'] == 'shutdown':
+            break
+
+
+def llm_worker_entry(*args, **kwargs):
+    asyncio.run(async_llm_worker(*args, **kwargs))
+
+
+class SwiftRolloutDeploy(SwiftPipeline):
+    args_class = RolloutArguments
+    args: args_class
+
+    def _register_rl_rollout_app(self):
+        self.app.get('/health/')(self.health)
+        self.app.get('/get_world_size/')(self.get_world_size)
+        self.app.get('/get_model_state_keys/')(self.get_model_state_keys)
+        self.app.post('/init_communicator/')(self.init_communicator)
+        self.app.post('/update_named_param/')(self.update_named_param)
+        self.app.post('/update_adapter_flattened_param/')(self.update_adapter_flattened_param)
+        self.app.post('/update_adapter_param/')(self.update_adapter_param)
+        self.app.post('/update_flattened_params/')(self.update_flattened_params)
+        self.app.post('/process_weights_after_loading/')(self.process_weights_after_loading)
+        self.app.post('/reset_prefix_cache/')(self.reset_prefix_cache)
+        self.app.post('/reset_encoder_cache/')(self.reset_encoder_cache)
+        self.app.post('/reset_mm_cache/')(self.reset_mm_cache)
+        self.app.post('/close_communicator/')(self.close_communicator)
+        self.app.post('/infer/', response_model=None)(self.infer)
+        self.app.post('/get_engine_type/')(self.get_engine_type)
+
+    def __init__(self, args: Optional[Union[List[str], RolloutArguments]] = None):
+        super().__init__(args)
+        self.use_gym_env = self.args.use_gym_env
+        self.use_async_engine = self.args.vllm_use_async_engine
+        self.num_connections = 1 if self.use_async_engine else self.args.vllm_data_parallel_size
+        safe_set_start_method()
+        self.app = FastAPI(lifespan=self.lifespan)
+        self._register_rl_rollout_app()
+        self.master_port = get_open_port()
+        self.connections = []
+        self.processes = []
+        self._start_data_parallel_workers()
+
+    def _start_data_parallel_workers(self):
+        for data_parallel_rank in range(self.num_connections):
+            parent_conn, child_conn = Pipe()
+            worker_func = llm_worker_entry if self.use_async_engine else llm_worker
+            process = Process(target=worker_func, args=(self.args, data_parallel_rank, self.master_port, child_conn))
+            process.start()
+            self.connections.append(parent_conn)
+            self.processes.append(process)
+
+    @asynccontextmanager
+    async def lifespan(self, app: FastAPI):
+        pending_connections = set(range(self.num_connections))
+
+        while pending_connections:
+            for idx in list(pending_connections):
+                connection = self.connections[idx]
+                if not connection.poll(timeout=0.1):
+                    if not self.processes[idx].is_alive():
+                        raise RuntimeError(f'Worker process {idx} exited unexpectedly during initialization. '
+                                           'Check worker logs for details.')
+                    continue
+                msg = connection.recv()
+                if isinstance(msg, dict) and msg.get('status') == 'error':
+                    error_msg = msg.get('error', 'Unknown error')
+                    raise RuntimeError(f'Worker process {idx} failed during initialization:\n{error_msg}')
+                if isinstance(msg, dict) and msg.get('status') == 'ready':
+                    pending_connections.discard(idx)
+
+        yield
+
+        # Wait for processes to terminate
+        for process in self.processes:
+            process.join(timeout=10)
+            if process.is_alive():
+                logger.warning(f'Process {process} is still alive after 10 seconds, attempting to terminate...')
+                process.terminate()
+                process.join()
+
+    @staticmethod
+    def get_infer_engine(args: RolloutArguments, template=None, **kwargs):
+        kwargs.update({
+            'model_id_or_path': args.model,
+            'model_type': args.model_type,
+            'revision': args.model_revision,
+            'torch_dtype': args.torch_dtype,
+            'template': template,
+            'use_async_engine': args.vllm_use_async_engine,
+            'max_lora_rank': args.vllm_max_lora_rank,
+        })
+        infer_backend = kwargs.pop('infer_backend', None) or args.infer_backend
+        if infer_backend != 'vllm':
+            infer_backend = 'vllm'
+            logger.info('Currently, rollout only supports the vLLM backend. Set vLLM backend')
+        kwargs.update(args.get_vllm_engine_kwargs())
+        kwargs.update({'enable_lora': args.vllm_enable_lora})  # override
+        # Important: Use processed_logprobs so temperature scaling affects the logprobs
+        # This is required for correct importance sampling in rollout correction
+        kwargs['logprobs_mode'] = 'processed_logprobs' if check_vllm_version_ge('0.10.2') else None
+        # used for RL external rollout backend
+        engine_kwargs = kwargs.get('engine_kwargs', {})
+        # for RL rollout model weight sync
+        engine_kwargs.update({'worker_extension_cls': 'swift.pipelines.infer.rollout.WeightSyncWorkerExtension'})
+
+        load_format = engine_kwargs.pop('load_format', 'auto')
+        kwargs['load_format'] = load_format
+
+        if args.vllm_use_async_engine and args.vllm_data_parallel_size > 1:
+            engine_kwargs['data_parallel_size'] = args.vllm_data_parallel_size
+        kwargs['engine_kwargs'] = engine_kwargs
+
+        return GRPOVllmEngine(**kwargs)
+
+    async def health(self):
+        """
+        Health check endpoint to verify that the server is running.
+        """
+        return {'status': 'ok'}
+
+    async def get_world_size(self):
+        """
+        Retrieves the world size from the LLM engine.
+
+        Returns:
+            `dict`:
+                A dictionary containing the world size.
+
+        Example response:
+        ```json
+        {"world_size": 8}
+        ```
+        """
+        return {'world_size': self.args.vllm_tensor_parallel_size * self.args.vllm_data_parallel_size}
+
+    async def get_model_state_keys(self):
+        """Get runtime vLLM model parameter names from one worker group."""
+        if not self.connections:
+            return {'keys': []}
+        kwargs = {'method': 'get_state_keys'}
+        self.connections[0].send({'type': 'call', 'method': 'collective_rpc', 'kwargs': kwargs})
+        result = self.connections[0].recv()
+
+        keys = []
+        if isinstance(result, list):
+            if result and all(isinstance(x, str) for x in result):
+                keys = result
+            else:
+                for item in result:
+                    if isinstance(item, list) and item and all(isinstance(x, str) for x in item):
+                        keys = item
+                        break
+        return {'keys': keys}
+
+    async def init_communicator(self, request: InitCommunicatorRequest):
+        """
+        Initializes the communicator for synchronizing model weights between a client and multiple server
+        workers.
+
+        Args:
+            request (`InitCommunicatorRequest`):
+                - `host` (`str`): Hostname or IP address of the master node.
+                - `port` (`int`): Port number to be used for communication.
+                - `world_size` (`int`): Total number of participating processes in the group.
+        """
+        world_size = self.args.vllm_tensor_parallel_size * self.args.vllm_data_parallel_size + 1
+
+        # The function init_communicator is called this way: init_communicator(host, port, world_size)
+        # So with collective_rpc we need to call it this way:
+        # llm.collective_rpc(method="init_communicator", args=(host, port, world_size))
+        kwargs = {'method': 'init_communicator', 'args': (request.host, request.port, world_size)}
+        for connection in self.connections:
+            connection.send({'type': 'fire_and_forget', 'method': 'collective_rpc', 'kwargs': kwargs})
+
+        return {'message': 'Request received, initializing communicator'}
+
+    async def update_named_param(self, request: UpdateWeightsRequest):
+        """
+        Updates the model weights with the provided tensor.
+
+        Once this endpoint is called, the client process should broadcast the updated weights to all server workers.
+
+        Args:
+            request (`UpdateWeightsRequest`):
+                - `name` (`str`): Name of the weight tensor being updated.
+                - `dtype` (`str`): Data type of the weight tensor (e.g., `"torch.float32"`).
+                - `shape` (list of `int`): Shape of the weight
+
+        """
+        # The function update_named_param is called this way: update_named_param("name", torch.float32, (10, 10))
+        # So with collective_rpc we need to call it this way:
+        # llm.collective_rpc("update_named_param", args=("name", torch.float32, (10, 10)))
+        kwargs = {'method': 'update_named_param', 'args': (request.name, request.dtype, tuple(request.shape))}
+        for connection in self.connections:
+            connection.send({'type': 'fire_and_forget', 'method': 'collective_rpc', 'kwargs': kwargs})
+
+        return {'message': 'Request received, updating named parameter'}
+
+    async def update_adapter_flattened_param(self, request: UpdateFlattenedAdapterRequest):
+        peft_config = asdict(request.peft_config)
+        metadatas = [
+            metadata.model_dump() if hasattr(metadata, 'model_dump') else metadata.dict()
+            for metadata in request.metadatas
+        ]
+        kwargs = {'method': 'update_adapter_flattened_param', 'args': (peft_config, metadatas)}
+        for connection in self.connections:
+            connection.send({'type': 'fire_and_forget', 'method': 'collective_rpc', 'kwargs': kwargs})
+
+        return {'message': 'Request received, updating adapter parameter'}
+
+    async def update_adapter_param(self, request: UpdateAdapterRequest):
+        """
+        Updates the LoRA adapter weights without flattening.
+        Each tensor is broadcast individually.
+
+        Args:
+            request (UpdateAdapterRequest):
+                - peft_config (LoraConfig): PEFT configuration for the adapter.
+                - lora_tensors_metadata (List[FlattenedTensorMetadata]): Metadata for each tensor.
+        """
+        peft_config = asdict(request.peft_config)
+        lora_tensors_metadata = [
+            metadata.model_dump() if hasattr(metadata, 'model_dump') else metadata.dict()
+            for metadata in request.lora_tensors_metadata
+        ]
+        kwargs = {'method': 'update_adapter_param', 'args': (peft_config, lora_tensors_metadata)}
+        for connection in self.connections:
+            connection.send({'type': 'fire_and_forget', 'method': 'collective_rpc', 'kwargs': kwargs})
+
+        return {'message': 'Request received, updating adapter parameter (non-flattened)'}
+
+    async def update_flattened_params(self, request: UpdateFlattenedParamsRequest):
+        """
+        Updates the model weights with flattened tensor data.
+
+        Args:
+            request (UpdateFlattenedParamsRequest):
+                - metadatas (List[FlattenedTensorMetadata]): Metadata for the flattened tensors.
+
+        """
+        metadatas = [
+            metadata.model_dump() if hasattr(metadata, 'model_dump') else metadata.dict()
+            for metadata in request.metadatas
+        ]
+        kwargs = {'method': 'update_flattened_params', 'args': (metadatas, )}
+        for connection in self.connections:
+            connection.send({'type': 'fire_and_forget', 'method': 'collective_rpc', 'kwargs': kwargs})
+
+        return {'message': 'Request received, updating flattened parameters'}
+
+    async def process_weights_after_loading(self):
+        """
+        Triggers process_weights_after_loading on all workers.
+        """
+        kwargs = {'method': 'process_weights_after_loading', 'args': ()}
+        for connection in self.connections:
+            connection.send({'type': 'call', 'method': 'collective_rpc', 'kwargs': kwargs})
+        # Wait for all workers to complete before returning
+        loop = asyncio.get_running_loop()
+        await asyncio.gather(*(loop.run_in_executor(None, connection.recv) for connection in self.connections))
+        return {'message': 'Weights processed after loading'}
+
+    async def reset_prefix_cache(self):
+        """
+        Resets the prefix cache for the model.
+        """
+        for connection in self.connections:
+            connection.send({'type': 'call', 'method': 'reset_prefix_cache'})
+        # Wait for and collect all results
+        all_outputs = [connection.recv() for connection in self.connections]
+        success = all(output for output in all_outputs)
+        return {'message': 'Request received, resetting prefix cache status: ' + str(success)}
+
+    async def reset_encoder_cache(self):
+        """Resets the encoder cache (vision encoder embeddings) for the model."""
+        for connection in self.connections:
+            connection.send({'type': 'call', 'method': 'reset_encoder_cache'})
+        all_outputs = [connection.recv() for connection in self.connections]
+        success = all(output for output in all_outputs)
+        return {'message': 'Request received, resetting encoder cache status: ' + str(success)}
+
+    async def reset_mm_cache(self):
+        """Resets the multimodal processor cache for the model."""
+        for connection in self.connections:
+            connection.send({'type': 'call', 'method': 'reset_mm_cache'})
+        all_outputs = [connection.recv() for connection in self.connections]
+        success = all(output for output in all_outputs)
+        return {'message': 'Request received, resetting mm cache status: ' + str(success)}
+
+    async def get_engine_type(self):
+        """
+        Return a dictionary describing the runtime engine configuration.
+
+        The returned object contains three keys:
+        - engine_type (str): Either 'AsyncLLMEngine' or 'LLMEngine', indicating
+        whether the asynchronous or synchronous engine is in use.
+        - use_gym_env (bool, optional): Present and True **only when**
+        ``use_async_engine`` and ``use_gym_env`` are both True.
+        - enable_multi_turn (bool): True if multi-turn scheduling is enabled
+        via ``args.multi_turn_scheduler``, otherwise False.
+
+        Returns
+        -------
+        dict
+            A concise specification of the current engine setup.
+        """
+        enable_multi_turn = False
+        if self.args.multi_turn_scheduler:
+            enable_multi_turn = True
+        use_gym_env = False
+        if self.use_async_engine and self.use_gym_env:
+            use_gym_env = True
+        engine_type = 'AsyncLLMEngine' if self.use_async_engine else 'LLMEngine'
+        enable_lora = self.args.vllm_enable_lora
+        return {
+            'engine_type': engine_type,
+            'enable_multi_turn': enable_multi_turn,
+            'use_gym_env': use_gym_env,
+            'enable_lora': enable_lora,
+        }
+
+    async def close_communicator(self):
+        """
+        Closes the weight update group and cleans up associated resources.
+        """
+        kwargs = {'method': 'close_communicator'}
+        for connection in self.connections:
+            connection.send({'type': 'fire_and_forget', 'method': 'collective_rpc', 'kwargs': kwargs})
+        return {'message': 'Request received, closing communicator'}
+
+    async def infer(
+        self,
+        infer_requests: List[Union[Dict, RolloutInferRequest]],
+        request_config: Optional[RequestConfig] = None,
+        *,
+        use_tqdm: Optional[bool] = None,
+    ):
+        chunked_infer_requests = chunk_list(infer_requests, self.num_connections)
+
+        # Send the prompts to each worker
+        for i, (connection, requests) in enumerate(zip(self.connections, chunked_infer_requests)):
+            # When the number of prompts is less than data_parallel_size, some workers will receive empty prompts.
+            # However, vLLM requires that we always send at least one prompt. So we send a placeholder prompt to comply
+            # with vLLM's requirement, and we later ignore the result.
+            if not requests:
+                requests = [RolloutInferRequest(messages=[{'role': 'user', 'content': '<placeholder>'}])]
+            kwargs = {'infer_requests': requests, 'request_config': request_config, 'use_tqdm': use_tqdm}
+            method = 'infer' if not self.use_async_engine else 'async_infer'
+            connection.send({'type': 'call', 'method': method, 'kwargs': kwargs})
+
+        all_outputs = [connection.recv() for connection in self.connections]
+        # Handle empty prompts (see above)
+        all_outputs = [output for output, requests in zip(all_outputs, chunked_infer_requests) if requests]
+        all_outputs = list(chain.from_iterable(all_outputs))  # from list of list to single list
+
+        return all_outputs
+
+    def run(self):
+        args = self.args
+        uvicorn.run(self.app, host=args.host, port=args.port, log_level=args.log_level)
+
+
+def rollout_main(args: Optional[Union[List[str], RolloutArguments]] = None) -> None:
+    SwiftRolloutDeploy(args).main()
+
+
+def is_accessible(port: int):
+    infer_client = InferClient(port=port)
+    try:
+        infer_client.get_model_list()
+    except ClientConnectorError:
+        return False
+    return True
+
+
+@contextmanager
+def run_rollout(args: RolloutArguments, return_url: bool = False):
+    if isinstance(args, RolloutArguments) and args.__class__.__name__ == 'RolloutArguments':
+        deploy_args = args
+    else:
+        args_dict = asdict(args)
+        parameters = inspect.signature(RolloutArguments).parameters
+        for k in list(args_dict.keys()):
+            if k not in parameters or args_dict[k] is None:
+                args_dict.pop(k)
+        deploy_args = RolloutArguments(**args_dict)
+
+    mp = multiprocessing.get_context('spawn')
+    process = mp.Process(target=rollout_main, args=(deploy_args, ))
+    process.start()
+    try:
+        while not is_accessible(deploy_args.port):
+            time.sleep(1)
+        yield f'http://127.0.0.1:{deploy_args.port}/v1' if return_url else deploy_args.port
+    finally:
+        process.terminate()
+        logger.info('The deployment process has been terminated.')

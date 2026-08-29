@@ -1,0 +1,341 @@
+import math, warnings, time
+import torch, torchvision, imageio, os
+import imageio.v3 as iio
+import urllib.request
+from io import BytesIO
+from PIL import Image
+from einops import repeat
+
+
+def _is_url(path):
+    return isinstance(path, str) and path.startswith(("http://", "https://"))
+
+
+def _load_image_from_url(url, timeout=30, max_retries=3):
+    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; DiffSynth-Studio)"})
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                image = Image.open(BytesIO(response.read()))
+                image.load()
+            return image
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+    raise RuntimeError(f"Failed to load image from URL '{url}' after {max_retries} attempts: {last_error}") from last_error
+
+
+class DataProcessingPipeline:
+    def __init__(self, operators=None):
+        self.operators: list[DataProcessingOperator] = [] if operators is None else operators
+        
+    def __call__(self, data):
+        for operator in self.operators:
+            data = operator(data)
+        return data
+    
+    def __rshift__(self, pipe):
+        if isinstance(pipe, DataProcessingOperator):
+            pipe = DataProcessingPipeline([pipe])
+        return DataProcessingPipeline(self.operators + pipe.operators)
+
+
+class DataProcessingOperator:
+    def __call__(self, data):
+        raise NotImplementedError("DataProcessingOperator cannot be called directly.")
+    
+    def __rshift__(self, pipe):
+        if isinstance(pipe, DataProcessingOperator):
+            pipe = DataProcessingPipeline([pipe])
+        return DataProcessingPipeline([self]).__rshift__(pipe)
+
+
+class DataProcessingOperatorRaw(DataProcessingOperator):
+    def __call__(self, data):
+        return data
+
+
+class ToInt(DataProcessingOperator):
+    def __call__(self, data):
+        return int(data)
+
+
+class ToFloat(DataProcessingOperator):
+    def __call__(self, data):
+        return float(data)
+
+
+class ToStr(DataProcessingOperator):
+    def __init__(self, none_value=""):
+        self.none_value = none_value
+    
+    def __call__(self, data):
+        if data is None: data = self.none_value
+        return str(data)
+
+
+class LoadImage(DataProcessingOperator):
+    def __init__(self, convert_RGB=True, convert_RGBA=False, url_timeout=30, url_max_retries=3):
+        self.convert_RGB = convert_RGB
+        self.convert_RGBA = convert_RGBA
+        self.url_timeout = url_timeout
+        self.url_max_retries = url_max_retries
+
+    def __call__(self, data: str):
+        if _is_url(data):
+            image = _load_image_from_url(data, timeout=self.url_timeout, max_retries=self.url_max_retries)
+        else:
+            image = Image.open(data)
+        if self.convert_RGB: image = image.convert("RGB")
+        if self.convert_RGBA: image = image.convert("RGBA")
+        return image
+
+
+class ImageCropAndResize(DataProcessingOperator):
+    def __init__(self, height=None, width=None, max_pixels=None, height_division_factor=1, width_division_factor=1):
+        self.height = height
+        self.width = width
+        self.max_pixels = max_pixels
+        self.height_division_factor = height_division_factor
+        self.width_division_factor = width_division_factor
+
+    def crop_and_resize(self, image, target_height, target_width):
+        width, height = image.size
+        scale = max(target_width / width, target_height / height)
+        image = torchvision.transforms.functional.resize(
+            image,
+            (round(height*scale), round(width*scale)),
+            interpolation=torchvision.transforms.InterpolationMode.BILINEAR
+        )
+        image = torchvision.transforms.functional.center_crop(image, (target_height, target_width))
+        return image
+    
+    def get_height_width(self, image):
+        if self.height is None or self.width is None:
+            width, height = image.size
+            if width * height > self.max_pixels:
+                scale = (width * height / self.max_pixels) ** 0.5
+                height, width = int(height / scale), int(width / scale)
+            height = height // self.height_division_factor * self.height_division_factor
+            width = width // self.width_division_factor * self.width_division_factor
+        else:
+            height, width = self.height, self.width
+        return height, width
+    
+    def __call__(self, data: Image.Image):
+        image = self.crop_and_resize(data, *self.get_height_width(data))
+        return image
+
+
+class ToList(DataProcessingOperator):
+    def __call__(self, data):
+        return [data]
+    
+
+class FrameSamplerByRateMixin:
+    def __init__(self, num_frames=81, time_division_factor=4, time_division_remainder=1, frame_rate=24, fix_frame_rate=False):
+        self.num_frames = num_frames
+        self.time_division_factor = time_division_factor
+        self.time_division_remainder = time_division_remainder
+        self.frame_rate = frame_rate
+        self.fix_frame_rate = fix_frame_rate
+
+    def get_reader(self, data: str):
+        return imageio.get_reader(data)
+
+    def get_available_num_frames(self, reader):
+        if not self.fix_frame_rate:
+            return reader.count_frames()
+        meta_data = reader.get_meta_data()
+        total_original_frames = int(reader.count_frames())
+        duration = meta_data["duration"] if "duration" in meta_data else total_original_frames / meta_data['fps']
+        total_available_frames = math.floor(duration * self.frame_rate)
+        return int(total_available_frames)
+
+    def get_num_frames(self, reader):
+        num_frames = self.num_frames
+        total_frames = self.get_available_num_frames(reader)
+        if int(total_frames) < num_frames:
+            num_frames = total_frames
+            while num_frames > 1 and num_frames % self.time_division_factor != self.time_division_remainder:
+                num_frames -= 1
+        return num_frames
+
+    def map_single_frame_id(self, new_sequence_id: int, raw_frame_rate: float, total_raw_frames: int) -> int:
+        if not self.fix_frame_rate:
+            return new_sequence_id
+        target_time_in_seconds = new_sequence_id / self.frame_rate
+        raw_frame_index_float = target_time_in_seconds * raw_frame_rate
+        frame_id = int(round(raw_frame_index_float))        
+        frame_id = min(frame_id, total_raw_frames - 1)
+        return frame_id
+
+
+class LoadVideo(DataProcessingOperator, FrameSamplerByRateMixin):
+    def __init__(self, num_frames=81, time_division_factor=4, time_division_remainder=1, frame_processor=lambda x: x, frame_rate=24, fix_frame_rate=False):
+        FrameSamplerByRateMixin.__init__(self, num_frames, time_division_factor, time_division_remainder, frame_rate, fix_frame_rate)
+        # frame_processor is build in the video loader for high efficiency.
+        self.frame_processor = frame_processor
+
+    def __call__(self, data: str):
+        reader = self.get_reader(data)
+        raw_frame_rate = reader.get_meta_data()['fps']
+        num_frames = self.get_num_frames(reader)
+        total_raw_frames = reader.count_frames()
+        frames = []
+        for frame_id in range(num_frames):
+            frame_id = self.map_single_frame_id(frame_id, raw_frame_rate, total_raw_frames)
+            frame = reader.get_data(frame_id)
+            frame = Image.fromarray(frame)
+            frame = self.frame_processor(frame)
+            frames.append(frame)
+        reader.close()
+        return frames
+
+
+class SequencialProcess(DataProcessingOperator):
+    def __init__(self, operator=lambda x: x):
+        self.operator = operator
+        
+    def __call__(self, data):
+        return [self.operator(i) for i in data]
+
+
+class LoadGIF(DataProcessingOperator):
+    def __init__(self, num_frames=81, time_division_factor=4, time_division_remainder=1, frame_processor=lambda x: x):
+        self.num_frames = num_frames
+        self.time_division_factor = time_division_factor
+        self.time_division_remainder = time_division_remainder
+        # frame_processor is build in the video loader for high efficiency.
+        self.frame_processor = frame_processor
+
+    def get_num_frames(self, path):
+        num_frames = self.num_frames
+        images = iio.imread(path, mode="RGB")
+        if len(images) < num_frames:
+            num_frames = len(images)
+            while num_frames > 1 and num_frames % self.time_division_factor != self.time_division_remainder:
+                num_frames -= 1
+        return num_frames
+        
+    def __call__(self, data: str):
+        num_frames = self.get_num_frames(data)
+        frames = []
+        images = iio.imread(data, mode="RGB")
+        for img in images:
+            frame = Image.fromarray(img)
+            frame = self.frame_processor(frame)
+            frames.append(frame)
+            if len(frames) >= num_frames:
+                break
+        return frames
+
+
+class RouteByExtensionName(DataProcessingOperator):
+    def __init__(self, operator_map):
+        self.operator_map = operator_map
+        
+    def __call__(self, data: str):
+        file_ext_name = data.split(".")[-1].lower()
+        for ext_names, operator in self.operator_map:
+            if ext_names is None or file_ext_name in ext_names:
+                return operator(data)
+        raise ValueError(f"Unsupported file: {data}")
+
+
+class RouteByType(DataProcessingOperator):
+    def __init__(self, operator_map):
+        self.operator_map = operator_map
+        
+    def __call__(self, data):
+        for dtype, operator in self.operator_map:
+            if dtype is None or isinstance(data, dtype):
+                return operator(data)
+        raise ValueError(f"Unsupported data: {data}")
+
+
+class LoadTorchPickle(DataProcessingOperator):
+    def __init__(self, map_location="cpu"):
+        self.map_location = map_location
+        
+    def __call__(self, data):
+        return torch.load(data, map_location=self.map_location, weights_only=False)
+
+
+class ToAbsolutePath(DataProcessingOperator):
+    def __init__(self, base_path=""):
+        self.base_path = base_path
+        
+    def __call__(self, data):
+        # A remote URL is already absolute; joining it with base_path would corrupt it.
+        if _is_url(data):
+            return data
+        return os.path.join(self.base_path, data)
+
+
+class LoadAudio(DataProcessingOperator):
+    def __init__(self, sr=16000):
+        self.sr = sr
+        import librosa
+        self.audio_loader = librosa.load
+    
+    def __call__(self, data: str):
+        input_audio, sample_rate = self.audio_loader(data, sr=self.sr)
+        return input_audio
+
+
+class LoadAudioWithTorchaudio(DataProcessingOperator, FrameSamplerByRateMixin):
+
+    def __init__(self, num_frames=121, time_division_factor=8, time_division_remainder=1, frame_rate=24, fix_frame_rate=True):
+        FrameSamplerByRateMixin.__init__(self, num_frames, time_division_factor, time_division_remainder, frame_rate, fix_frame_rate)
+        import torchaudio
+        self.audio_loader = torchaudio.load
+
+    def __call__(self, data: str):
+        try:
+            reader = self.get_reader(data)
+            num_frames = self.get_num_frames(reader)
+            duration = num_frames / self.frame_rate
+            waveform, sample_rate = self.audio_loader(data)
+            target_samples = int(duration * sample_rate)
+            current_samples = waveform.shape[-1]
+            if current_samples > target_samples:
+                waveform = waveform[..., :target_samples]
+            elif current_samples < target_samples:
+                padding = target_samples - current_samples
+                waveform = torch.nn.functional.pad(waveform, (0, padding))
+            return waveform, sample_rate
+        except:
+            warnings.warn(f"Cannot load audio in {data}. The audio will be `None`.")
+            return None
+
+
+class LoadPureAudioWithTorchaudio(DataProcessingOperator):
+
+    def __init__(self, target_sample_rate=None, max_audio_duration=None, padding=False, channels=2):
+        self.target_sample_rate = target_sample_rate
+        self.max_audio_duration = max_audio_duration
+        self.resample = True if target_sample_rate is not None else False
+        self.padding = padding
+        from diffsynth.utils.data.audio import read_audio
+        self.audio_loader = read_audio
+
+    def __call__(self, data: str):
+        try:
+            waveform, sample_rate = self.audio_loader(data, resample=self.resample, resample_rate=self.target_sample_rate)
+            if self.max_audio_duration is not None:
+                target_samples = int(self.max_audio_duration * sample_rate)
+                current_samples = waveform.shape[-1]
+                if current_samples > target_samples:
+                    waveform = waveform[..., :target_samples]
+                elif current_samples < target_samples and self.padding:
+                    padding = target_samples - current_samples
+                    waveform = torch.nn.functional.pad(waveform, (0, padding))
+            if waveform.shape[0] == 1:
+                waveform = repeat(waveform, "C L -> (N C) L", N=2)
+            return waveform, sample_rate
+        except Exception as e:
+            print(f"Cannot load audio in {data} due to {e}. The audio will be `None`.")
+            return None

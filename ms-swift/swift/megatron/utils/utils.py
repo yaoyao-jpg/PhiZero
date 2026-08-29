@@ -1,0 +1,297 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
+import re
+import torch
+import torch.distributed as dist
+from megatron.core import mpu
+from megatron.core.extensions.transformer_engine import TEGroupedLinear, TELayerNormColumnParallelLinear, TELinear
+from megatron.core.inference.communication_utils import recv_from_prev_pipeline_rank_, send_to_next_pipeline_rank
+from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.ssm.mamba_context_parallel import _undo_attention_load_balancing
+from megatron.core.transformer.moe.router import TopKRouter
+from torch import nn
+from transformers.utils import is_torch_npu_available
+
+from swift.tuners import LoraConfig, Swift
+from swift.utils import (activate_parameters, deep_getattr, find_layers, freeze_parameters, get_logger,
+                         get_model_parameter_info)
+from swift.utils import get_packed_seq_params as _get_packed_seq_params
+
+logger = get_logger()
+
+
+def find_all_linears(model, extra_layers=None):
+
+    def _cond(name, module):
+        if (extra_layers and isinstance(module, tuple(extra_layers))) or name != 'output_layer' and isinstance(
+                module, (TELinear, TELayerNormColumnParallelLinear, TEGroupedLinear, nn.Linear)):
+            return True
+        return False
+
+    return find_layers(model, _cond)
+
+
+def find_router(model):
+    return find_layers(model, lambda name, module: isinstance(module, TopKRouter))
+
+
+def find_embedding(model):
+    return find_layers(model, lambda name, module: isinstance(module, LanguageModelEmbedding))
+
+
+def get_multimodal_target_regex(
+    args,
+    model,
+    *,
+    freeze_llm: bool = False,
+    freeze_vit: bool = True,
+    freeze_aligner: bool = True,
+    include_embedding: bool = False,
+    include_router: bool = False,
+) -> str:
+    megatron_model_meta = args.megatron_model_meta
+    modules = []
+    visual_cls = megatron_model_meta.visual_cls
+    vision_tower = [f'visual.{vit}' for vit in visual_cls._vision_tower]
+    aligner = [f'visual.{aligner}' for aligner in visual_cls._aligner]
+    if not freeze_llm:
+        modules.append('language_model')
+    if not freeze_vit:
+        modules += vision_tower
+    if not freeze_aligner:
+        modules += aligner
+    assert len(modules) > 0, f'modules: {modules}'
+    extra_layers = []
+    if include_embedding:
+        extra_layers.append(LanguageModelEmbedding)
+    if include_router:
+        extra_layers.append(TopKRouter)
+
+    res = []
+    for module in modules:
+        rejected_modules = []
+        if not freeze_vit:
+            for _aligner in aligner:
+                if _aligner.startswith(f'{module}.'):
+                    rejected_modules.append(_aligner)
+
+        sub_module = deep_getattr(model, module)
+        if sub_module is None:
+            continue
+        target_modules = find_all_linears(sub_module, extra_layers)
+        if not target_modules:
+            continue
+        target_modules = [tm for tm in target_modules if tm]
+        target_pattern = rf'.*\.({"|".join(target_modules)})' if target_modules else ''
+        rejected_pattern = rf'(?!({"|".join(rejected_modules)}))' if rejected_modules else ''
+        res.append(rf'{rejected_pattern}{re.escape(module)}(?=\.){target_pattern}')
+
+    return rf'^({"|".join(res)})$'
+
+
+def get_target_modules(args, model):
+    if isinstance(args.target_modules, str):
+        return args.target_modules
+    target_modules = args.target_modules.copy()
+    if 'all-linear' in target_modules:
+        if args.is_multimodal and not args.language_model_only:
+            if args.tuner_type == 'lora_llm':
+                kwargs = {
+                    'freeze_llm': False,
+                    'freeze_vit': True,
+                    'freeze_aligner': True,
+                }
+            else:  # lora
+                kwargs = {
+                    'freeze_llm': args.freeze_llm,
+                    'freeze_vit': args.freeze_vit,
+                    'freeze_aligner': args.freeze_aligner,
+                }
+            return get_multimodal_target_regex(
+                args,
+                model,
+                include_embedding='all-embedding' in target_modules,
+                include_router='all-router' in target_modules,
+                **kwargs,
+            )
+        else:
+            target_modules.remove('all-linear')
+            target_modules += find_all_linears(model)
+    if 'all-embedding' in target_modules:
+        target_modules.remove('all-embedding')
+        target_modules += find_embedding(model)
+    if 'all-router' in target_modules:
+        target_modules.remove('all-router')
+        target_modules += find_router(model)
+    return target_modules
+
+
+def get_modules_to_save(args, model):
+    if args.task_type == 'seq_cls':
+        args.modules_to_save.append('output_layer')
+    modules_to_save = args.modules_to_save.copy()
+    if 'all-embedding' in args.modules_to_save:
+        modules_to_save.remove('all-embedding')
+        modules_to_save += find_embedding(model)
+    return modules_to_save
+
+
+def prepare_adapter(args, model):
+    target_modules = get_target_modules(args, model)
+    modules_to_save = get_modules_to_save(args, model)
+    lora_kwargs = {
+        'r': args.lora_rank,
+        'target_modules': target_modules,
+        'lora_alpha': args.lora_alpha,
+        'lora_dropout': args.lora_dropout,
+        'bias': args.lora_bias,
+        'modules_to_save': modules_to_save,
+        'use_rslora': args.use_rslora,
+    }
+    lora_config = LoraConfig(task_type='CAUSAL_LM', lora_dtype=args.lora_dtype, **lora_kwargs)
+    logger.info(f'lora_config: {lora_config}')
+    model = Swift.prepare_model(model, lora_config)
+    if args.mcore_ref_adapter or args.ref_adapters:
+        model.add_adapter('ref_adapter', lora_config)
+        model.base_model._cast_adapter_dtype(adapter_name='ref_adapter', autocast_adapter_dtype=True)
+        for n, p in model.named_parameters():
+            if '.ref_adapter.' in n:
+                p.requires_grad = False
+    return model
+
+
+def _prepare_full_vit(args, model):
+    megatron_model_meta = args.megatron_model_meta
+    visual_cls = megatron_model_meta.visual_cls
+    vision_tower = [f'visual.{vit}' for vit in visual_cls._vision_tower]
+    aligner = [f'visual.{aligner}' for aligner in visual_cls._aligner]
+    for module_prefix in vision_tower + aligner:
+        module = deep_getattr(model, module_prefix)
+        if module is not None:
+            module.requires_grad_(True)
+
+
+def prepare_mcore_model(args, model):
+    if args.tuner_type == 'full':
+        freeze_parameters(model, args.freeze_parameters_ratio, args.freeze_parameters, args.freeze_parameters_regex)
+        if args.trainable_parameters or args.trainable_parameters_regex:
+            activate_parameters(model, args.trainable_parameters, args.trainable_parameters_regex)
+    elif args.tuner_type in {'lora', 'lora_llm'}:
+        model = prepare_adapter(args, model)
+        if args.tuner_type == 'lora_llm':
+            _prepare_full_vit(args, model)
+    logger.info(f'model: {model}')
+    logger.info_if(
+        f'[rank{dist.get_rank()}] model_parameter_info: {get_model_parameter_info(model)}',
+        cond=mpu.get_data_parallel_rank() == 0)
+    return model
+
+
+def forward_step_helper(model, inputs, dtype=None):
+    config = model.config
+    dtype = dtype or config.params_dtype
+    if not mpu.is_pipeline_first_stage():
+        recv_shape_buffer = torch.empty((3, ), device=torch.cuda.current_device(), dtype=torch.int64)
+        recv_from_prev_pipeline_rank_(recv_shape_buffer)
+        recv_buffer = torch.empty(recv_shape_buffer.tolist(), device=torch.cuda.current_device(), dtype=dtype)
+        recv_from_prev_pipeline_rank_(recv_buffer)
+        model.set_input_tensor(recv_buffer)
+    output_tensor = model(**inputs)
+    if not mpu.is_pipeline_last_stage():
+        recv_shape_buffer = torch.tensor(output_tensor.shape, device=torch.cuda.current_device(), dtype=torch.int64)
+        send_to_next_pipeline_rank(recv_shape_buffer)
+        send_to_next_pipeline_rank(output_tensor)
+        output_tensor = None
+
+    return output_tensor
+
+
+def get_padding_to(args):
+    padding_to = None
+    if args.tensor_model_parallel_size > 1 and args.sequence_parallel:
+        padding_to = args.tensor_model_parallel_size
+    if args.context_parallel_size > 1:
+        padding_to = (padding_to or 1) * args.context_parallel_size
+    origin_padding_to = padding_to
+    fp8_format = getattr(args, 'fp8_format', None) or getattr(args, 'fp8', None)
+    fp4_format = getattr(args, 'fp4_format', None) or getattr(args, 'fp4', None)
+    if args.fp8_recipe == 'blockwise':
+        padding_to = (padding_to or 1) * 128
+    elif args.fp8_recipe == 'mxfp8':
+        # MXFP8 uses a block size of 32. Under sequence parallel, the sequence is
+        # split across TP ranks, so each per-rank shard (seq_len / TP) must itself
+        # be divisible by 32. Pad the total length to TP * 32 to guarantee this.
+        padding_to = (padding_to or 1) * 32
+    elif fp8_format is not None or fp4_format is not None:
+        padding_to = (padding_to or 1) * 16
+    if args.attention_backend == 'fused':
+        padding_to = max(padding_to or 1, ((origin_padding_to) or 1) * 64)
+    return padding_to
+
+
+def get_packed_seq_params(args, position_ids: torch.Tensor) -> PackedSeqParams:
+    params = _get_packed_seq_params(position_ids)
+    # max_seqlen must be a Python int rather than a 0-dim CUDA tensor.
+    # flash-attn 4 (CuTe DSL) embeds booleans derived from max_seqlen into its
+    # backward-kernel compile-cache key; a tensor there hashes by object identity,
+    # so the cache never hits and every micro-batch backward triggers a full JIT
+    # recompilation (~30s each), slowing training by >10x.
+    max_seqlen_q = params['max_length_q']
+    max_seqlen_kv = params['max_length_k']
+    if isinstance(max_seqlen_q, torch.Tensor):
+        max_seqlen_q = int(max_seqlen_q.item())
+    if isinstance(max_seqlen_kv, torch.Tensor):
+        max_seqlen_kv = int(max_seqlen_kv.item())
+    packed = PackedSeqParams(
+        cu_seqlens_q=params['cu_seq_lens_q'],
+        cu_seqlens_kv=params['cu_seq_lens_k'],
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_kv=max_seqlen_kv,
+        qkv_format='thd',
+    )
+    if hasattr(packed, 'cp_partition_mode'):
+        packed.cp_partition_mode = args.cp_partition_mode
+
+    if is_torch_npu_available():
+        packed.cu_seqlens_q_padded = params['cu_seq_lens_q']
+        packed.cu_seqlens_kv_padded = params['cu_seq_lens_k']
+
+    return packed
+
+
+def reconstruct_tensor_cp(tensor, packed_seq_params, dim=1) -> torch.Tensor:
+    """In CP mode, all-gather and undo the load-balanced (zigzag) chunking
+    produced by ``split_cp_inputs``, restoring the full sequence in original
+    token order along ``dim``.
+
+    Args:
+        tensor: CP-sharded local tensor whose sequence dim is at ``dim``.
+        packed_seq_params: ``PackedSeqParams`` for THD inputs, or ``None`` for
+            regular ``[B, S, ...]`` inputs.
+        dim: Sequence dimension index of ``tensor`` (default: 1).
+
+    Returns:
+        torch.Tensor: Full-sequence tensor with the same shape as ``tensor``
+        except the size at ``dim`` is multiplied by ``cp_size``.
+    """
+
+    cp_size = mpu.get_context_parallel_world_size()
+    if cp_size <= 1:
+        return tensor
+
+    cp_rank = mpu.get_context_parallel_rank()
+    cp_group = mpu.get_context_parallel_group()
+
+    # All-gather across CP ranks (preserve local autograd graph for `tensor`).
+    output_list = [torch.empty_like(tensor) for _ in range(cp_size)]
+    torch.distributed.all_gather(output_list, tensor.contiguous(), group=cp_group)
+    output_list[cp_rank] = tensor
+    gathered = torch.cat(output_list, dim=dim)
+
+    # `_undo_attention_load_balancing` assumes sequence dim is 0; transpose if needed.
+    if dim != 0:
+        gathered = gathered.transpose(0, dim).contiguous()
+    out = _undo_attention_load_balancing(gathered, cp_size, packed_seq_params)
+    if dim != 0:
+        out = out.transpose(0, dim).contiguous()
+    return out

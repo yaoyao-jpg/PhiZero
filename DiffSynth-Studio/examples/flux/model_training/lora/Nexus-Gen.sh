@@ -1,0 +1,19 @@
+modelscope download --dataset DiffSynth-Studio/diffsynth_example_dataset --include "flux/Nexus-Gen/*" --local_dir ./data/diffsynth_example_dataset
+
+accelerate launch examples/flux/model_training/train.py \
+  --dataset_base_path data/diffsynth_example_dataset/flux/Nexus-Gen \
+  --dataset_metadata_path data/diffsynth_example_dataset/flux/Nexus-Gen/metadata.csv \
+  --data_file_keys "image,nexus_gen_reference_image" \
+  --max_pixels 1048576 \
+  --dataset_repeat 400 \
+  --model_id_with_origin_paths "DiffSynth-Studio/Nexus-GenV2:model*.safetensors,DiffSynth-Studio/Nexus-GenV2:edit_decoder.bin,black-forest-labs/FLUX.1-dev:text_encoder/model.safetensors,black-forest-labs/FLUX.1-dev:text_encoder_2/*.safetensors,black-forest-labs/FLUX.1-dev:ae.safetensors" \
+  --learning_rate 1e-4 \
+  --num_epochs 5 \
+  --remove_prefix_in_ckpt "pipe.dit." \
+  --output_path "./models/train/FLUX.1-NexusGen-Edit_lora" \
+  --lora_base_model "dit" \
+  --lora_target_modules "a_to_qkv,b_to_qkv,ff_a.0,ff_a.2,ff_b.0,ff_b.2,a_to_out,b_to_out,proj_out,norm.linear,norm1_a.linear,norm1_b.linear,to_qkv_mlp" \
+  --lora_rank 32 \
+  --align_to_opensource_format \
+  --extra_inputs "nexus_gen_reference_image" \
+  --use_gradient_checkpointing

@@ -1,0 +1,12 @@
+video
+../motion_transfer/cases/ego2dex/ego2dex_transfer_01/source_video.mp4
+../motion_transfer/cases/ego2dex/ego2dex_transfer_02/source_video.mp4
+../motion_transfer/cases/ego2dex/ego2dex_transfer_03/source_video.mp4
+../motion_transfer/cases/human2robot/human2robot_transfer_01/source_video.mp4
+../motion_transfer/cases/human2robot/human2robot_transfer_02/source_video.mp4
+../motion_transfer/cases/human2robot/human2robot_transfer_03/source_video.mp4
+../motion_transfer/cases/human2robot/human2robot_transfer_04/source_video.mp4
+../motion_transfer/cases/sim2real/sim2real_transfer_01/source_video.mp4
+../motion_transfer/cases/sim2real/sim2real_transfer_02/source_video.mp4
+../motion_transfer/cases/sim2real/sim2real_transfer_03/source_video.mp4
+../motion_transfer/cases/sim2real/sim2real_transfer_04/source_video.mp4
